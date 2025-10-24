@@ -17,25 +17,19 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 import html
 from mistralai import Mistral
-from gsheets_storage import gsheets_storage
 
 # ==================== КОНФИГУРАЦИЯ ====================
-# Получаем переменные окружения с Render
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+BOT_TOKEN = "8023437078:AAFT5qCCe05oVgKgqaBZlbzuq1nd4wLizhM"
+MISTRAL_API_KEY = "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV"
+BOT_USERNAME = "team_spirt2_bot"
 
-# Проверяем, что переменные загружены
-if not BOT_TOKEN or not MISTRAL_API_KEY:
-    logging.error("❌ Не найдены BOT_TOKEN или MISTRAL_API_KEY в переменных окружения!")
-    exit(1)
-
-# Остальные константы
+# Константы
 LAST_POST_FILE = "last_telegram_post.json"
 TELEGRAM_CHANNEL = "newcsgo"
 TELEGRAM_CHANNEL_URL = f"https://t.me/s/{TELEGRAM_CHANNEL}"
 CHECK_INTERVAL = 60
 
-CHAT_ID = -4619177118
+CHAT_ID = -1003200108763
 TARGET_CHAT_ID = CHAT_ID
 USERS_FILE = "users.json"
 EVENTS_FILE = "events.json"
@@ -47,315 +41,46 @@ client = Mistral(api_key=MISTRAL_API_KEY)
 TRIGGER_WORDS = ["габен", "хуесос"]
 JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
 
-# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Для вывода в консоль Render
-    ]
-)
+# ==================== КОНФИГУРАЦИЯ ТЕМ ====================
+TOPIC_IDS = {
+    "HUMAN_CHAT": 8,
+    "BOT_CHAT": 3, 
+    "NEWS_CHAT": 6
+}
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# ==================== УТИЛИТЫ ====================
+def extract_command(text: str, bot_username: str) -> str:
+    """Извлекает чистую команду из текста с упоминанием бота"""
+    if not text:
+        return ""
+    text = re.sub(rf'@{re.escape(bot_username)}\s*', '', text)
+    return text.strip()
 
+def escape_markdown_v2(text):
+    """Экранирование символов для MarkdownV2"""
+    if not text:
+        return ""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-
-def load_last_post():
-    """Загружает данные о последнем посте из Google Sheets"""
-    try:
-        data = gsheets_storage.load_data("last_post")
-        if not data:
-            return None, set()
-        
-        last_post_time = data.get("last_post_time")
-        processed_posts_list = data.get("processed_posts", [])
-        processed_posts = set(processed_posts_list)
-        return last_post_time, processed_posts
-        
-    except Exception as e:
-        logging.error(f"❌ Ошибка загрузки last_post: {e}")
-        return None, set()
-
-def save_last_post(post_time, processed_posts):
-    """Сохраняет данные о последнем посте в Google Sheets"""
-    try:
-        data = {
-            "last_post_time": post_time,
-            "processed_posts": list(processed_posts)
-        }
-        return gsheets_storage.save_data("last_post", data)
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения last_post: {e}")
-        return False
-
-def create_post_id(post):
-    text_hash = hash(post['text'][:100] if post['text'] else "media") % 10000
-    return f"{post['time']}_{text_hash}"
-
-async def get_telegram_posts():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
+def is_allowed_topic(message: Message) -> bool:
+    """Проверяет можно ли боту отвечать в этой теме"""
+    topic_id = message.message_thread_id
     
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(TELEGRAM_CHANNEL_URL, headers=headers) as response:
-                if response.status != 200:
-                    logging.error(f"Ошибка доступа к каналу: {response.status}")
-                    return None
-                
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                messages = soup.find_all('div', class_='tgme_widget_message')
-                posts = []
-                
-                for message in messages:
-                    try:
-                        # Проверяем, является ли сообщение реплаем
-                        is_reply = bool(message.find('a', class_='tgme_widget_message_reply'))
-                        
-                        # Текст сообщения - берем из реплая если это реплай
-                        text_element = message.find('div', class_='tgme_widget_message_text')
-                        
-                        # Если это реплай, проверяем есть ли собственный текст
-                        if is_reply and text_element:
-                            # Ищем текст который относится именно к этому сообщению, а не к цитируемому
-                            reply_wrapper = message.find('div', class_='tgme_widget_message_reply')
-                            if reply_wrapper:
-                                # Убираем текст цитаты из общего текста
-                                reply_text = reply_wrapper.get_text(strip=True)
-                                full_text = text_element.get_text(strip=True, separator='\n')
-                                # Берем текст после цитаты
-                                if reply_text in full_text:
-                                    post_text = full_text.replace(reply_text, '').strip()
-                                else:
-                                    post_text = full_text
-                            else:
-                                post_text = text_element.get_text(strip=True, separator='\n')
-                        elif text_element:
-                            post_text = text_element.get_text(strip=True, separator='\n')
-                        else:
-                            post_text = ""
-                        
-                        # Время сообщения
-                        time_element = message.find('time', class_='time')
-                        post_time = time_element['datetime'] if time_element and 'datetime' in time_element.attrs else None
-                        
-                        # Ссылка на пост
-                        post_link_element = message.find('a', class_='tgme_widget_message_date')
-                        post_url = post_link_element['href'] if post_link_element and 'href' in post_link_element.attrs else None
-                        
-                        # ФОТО: множественные фото (карусель)
-                        photo_elements = message.find_all('a', class_='tgme_widget_message_photo_wrap')
-                        photo_urls = []
-                        for photo_element in photo_elements:
-                            if 'style' in photo_element.attrs:
-                                style = photo_element['style']
-                                match = re.search(r"background-image:url\('([^']+)'\)", style)
-                                if match:
-                                    photo_urls.append(match.group(1))
-                        
-                        # ВИДЕО: поиск видео элементов
-                        video_elements = message.find_all('video', class_='tgme_widget_message_video')
-                        video_urls = []
-                        for video_element in video_elements:
-                            if video_element.get('src'):
-                                video_urls.append(video_element['src'])
-                        
-                        # Документы/файлы
-                        document_elements = message.find_all('a', class_='tgme_widget_message_document_wrap')
-                        documents = []
-                        for doc_element in document_elements:
-                            doc_url = doc_element.get('href', '')
-                            doc_title_elem = doc_element.find('div', class_='tgme_widget_message_document_title')
-                            doc_title = doc_title_elem.text.strip() if doc_title_elem else "Документ"
-                            documents.append({'url': doc_url, 'title': doc_title})
-                        
-                        # Проверяем, есть ли хоть какой-то контент
-                        has_content = post_text or photo_urls or video_urls or documents
-                        
-                        if has_content and post_time:
-                            post_data = {
-                                'text': post_text,
-                                'time': post_time,
-                                'photo_urls': photo_urls,
-                                'video_urls': video_urls,
-                                'documents': documents,
-                                'url': post_url,
-                                'is_reply': is_reply  # добавляем информацию о том, что это реплай
-                            }
-                            post_data['id'] = create_post_id(post_data)
-                            posts.append(post_data)
-                            
-                    except Exception as e:
-                        logging.error(f"Ошибка парсинга сообщения: {e}")
-                        continue
-                
-                return posts
-                
-    except Exception as e:
-        logging.error(f"Ошибка при парсинге канала: {e}")
-        return None
-
-async def send_telegram_post(post):
-    try:
-        clean_text = clean_markdown_text(post['text']) if post['text'] else ""
-        
-        caption = f"📢 **Новый пост из канала**\n\n"
-        if clean_text:
-            text_preview = clean_text[:800] + "..." if len(clean_text) > 800 else clean_text
-            caption += text_preview
-        
-        if post['url']:
-            caption += f"\n\n[Ссылка на пост]({post['url']})"
-        
-        normalized_photo_urls = [normalize_url(url) for url in post['photo_urls']]
-        normalized_video_urls = [normalize_url(url) for url in post['video_urls']]
-        normalized_documents = []
-        for doc in post['documents']:
-            normalized_doc = doc.copy()
-            normalized_doc['url'] = normalize_url(doc['url'])
-            normalized_documents.append(normalized_doc)
-        
-        if normalized_photo_urls:
-            if len(normalized_photo_urls) == 1:
-                photo_data = await download_media(normalized_photo_urls[0])
-                if photo_data:
-                    photo_file = BufferedInputFile(photo_data, filename="photo.jpg")
-                    await bot.send_photo(
-                        chat_id=TARGET_CHAT_ID,
-                        photo=photo_file,
-                        caption=caption,
-                        parse_mode="Markdown"
-                    )
-                else:
-                    await send_text_fallback(clean_text, post['url'])
-            else:
-                media_group = []
-                successful_downloads = 0
-                
-                for i, photo_url in enumerate(normalized_photo_urls[:10]):
-                    photo_data = await download_media(photo_url)
-                    if photo_data:
-                        photo_file = BufferedInputFile(photo_data, filename=f"photo_{i}.jpg")
-                        if i == 0:
-                            media_group.append(
-                                InputMediaPhoto(
-                                    media=photo_file,
-                                    caption=caption,
-                                    parse_mode="Markdown"
-                                )
-                            )
-                        else:
-                            media_group.append(InputMediaPhoto(media=photo_file))
-                        successful_downloads += 1
-                
-                if successful_downloads > 0:
-                    await bot.send_media_group(
-                        chat_id=TARGET_CHAT_ID,
-                        media=media_group
-                    )
-                else:
-                    await send_text_fallback(clean_text, post['url'])
-        
-        elif normalized_video_urls:
-            video_data = await download_media(normalized_video_urls[0])
-            if video_data:
-                video_file = BufferedInputFile(video_data, filename="video.mp4")
-                await bot.send_video(
-                    chat_id=TARGET_CHAT_ID,
-                    video=video_file,
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-            else:
-                await send_text_fallback(clean_text, post['url'])
-        
-        elif normalized_documents:
-            doc = normalized_documents[0]
-            doc_data = await download_media(doc['url'])
-            if doc_data:
-                doc_file = BufferedInputFile(doc_data, filename=doc['title'])
-                doc_caption = f"{caption}\n\n📎 {doc['title']}"
-                await bot.send_document(
-                    chat_id=TARGET_CHAT_ID,
-                    document=doc_file,
-                    caption=doc_caption,
-                    parse_mode="Markdown"
-                )
-            else:
-                await send_text_fallback(clean_text, post['url'], doc['title'])
-        
-        elif clean_text:
-            await bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                text=caption,
-                parse_mode="Markdown",
-                disable_web_page_preview=False
-            )
-        
-        logging.info("✅ Новый пост отправлен в чат")
+    if not any(TOPIC_IDS.values()):
         return True
-        
-    except Exception as e:
-        logging.error(f"❌ Ошибка при отправке поста: {e}")
-        return await send_text_fallback(post.get('text', ''), post.get('url'), fallback=True)
-
-async def check_telegram_channel():
-    logging.info("🔍 Проверяем новые посты в канале...")
     
-    posts = await get_telegram_posts()
-    if not posts:
-        return
+    if topic_id == TOPIC_IDS["BOT_CHAT"]:
+        return True
     
-    last_post_time, processed_posts = load_last_post()
+    if topic_id is None:
+        return False
     
-    new_posts_found = 0
-    latest_post_time = last_post_time
-    
-    for post in posts:
-        post_id = post['id']
+    return False
 
-        if post_id in processed_posts:
-            continue
-
-        is_new_post = (
-            last_post_time is None or 
-            post['time'] > last_post_time
-        )
-        
-        if is_new_post:
-            logging.info(f"🆕 Найден новый пост: {post['time']}")
-            
-            # Отправляем пост
-            success = await send_telegram_post(post)
-            
-            if success:
-                processed_posts.add(post_id) 
-                if latest_post_time is None or post['time'] > latest_post_time:
-                    latest_post_time = post['time']
-                new_posts_found += 1
-
-                await asyncio.sleep(1)
-    
-    # Сохраняем состояние
-    if new_posts_found > 0:
-        save_last_post(latest_post_time, processed_posts)
-        logging.info(f"✅ Обработано {new_posts_found} новых постов")
-    else:
-        logging.info("📭 Новых постов нет")
-
-    if len(processed_posts) > 100:
-        processed_posts_list = list(processed_posts)
-        processed_posts = set(processed_posts_list[-50:])
-        save_last_post(latest_post_time, processed_posts)
-
-async def scheduled_channel_check():
-    while True:
-        await check_telegram_channel()
-        await asyncio.sleep(CHECK_INTERVAL)
+def is_news_topic(message: Message) -> bool:
+    """Проверяет это тема для новостей"""
+    return message.message_thread_id == TOPIC_IDS["NEWS_CHAT"]
 
 def normalize_url(url, base_url="https://t.me"):
     if not url:
@@ -367,191 +92,117 @@ def normalize_url(url, base_url="https://t.me"):
     else:
         return url
 
-async def download_media(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Referer": "https://t.me/"
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=30) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    return content
-                else:
-                    logging.error(f"Ошибка загрузки медиа: {response.status}")
-                    return None
-    except Exception as e:
-        logging.error(f"Ошибка при загрузке медиа: {e}")
-        return None
-
 def clean_markdown_text(text):
     if not text:
         return text
-    
     text = html.escape(text)
-    
-    text = re.sub(r'\[([^\]]*)\]\([^\)]*$', r'\1', text)  # незакрытые ссылки
-    text = re.sub(r'\*\*([^*]*)$', r'\1', text)  # незакрытый жирный текст
-    text = re.sub(r'\*([^*]*)$', r'\1', text)    # незакрытый курсив
-    text = re.sub(r'__([^_]*)$', r'\1', text)    # незакрытый подчеркнутый
-    text = re.sub(r'`([^`]*)$', r'\1', text)     # незакрытый код
-    
+    text = re.sub(r'\[([^\]]*)\]\([^\)]*$', r'\1', text)
+    text = re.sub(r'\*\*([^*]*)$', r'\1', text)
+    text = re.sub(r'\*([^*]*)$', r'\1', text)
+    text = re.sub(r'__([^_]*)$', r'\1', text)
+    text = re.sub(r'`([^`]*)$', r'\1', text)
     text = re.sub(r'_{3,}', '___', text)
-    
     return text
 
-async def send_text_fallback(text, url=None, doc_title=None, fallback=False):
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ ====================
+def load_last_post():
     try:
-        caption = "📢 Новый пост из канала\n\n"
-        
-        if text:
-            clean_text = re.sub(r'[`*_\[\]()]', '', text)
-            text_preview = clean_text[:1000] + "..." if len(clean_text) > 1000 else clean_text
-            caption += text_preview
-        
-        if url:
-            caption += f"\n\nСсылка: {url}"
-        
-        if doc_title:
-            caption += f"\n\n📎 {doc_title}"
-        
-        if fallback:
-            caption += "\n\n⚠️ Оригинальное форматирование могло быть потеряно из-за ошибки разметки"
-        
-        await bot.send_message(
-            chat_id=TARGET_CHAT_ID,
-            text=caption,
-            parse_mode=None,  # Без разметки
-            disable_web_page_preview=False
-        )
-        return True
+        if not os.path.exists(LAST_POST_FILE):
+            return None, set()
+        with open(LAST_POST_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return None, set()
+            data = json.loads(content)
+            return data.get("last_post_time"), set(data.get("processed_posts", []))
     except Exception as e:
-        logging.error(f"❌ Фолбэк тоже не сработал: {e}")
-        return False
+        logging.error(f"Ошибка загрузки last_post: {e}")
+        return None, set()
+
+def save_last_post(post_time, processed_posts):
+    try:
+        with open(LAST_POST_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "last_post_time": post_time,
+                "processed_posts": list(processed_posts)
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения last_post: {e}")
 
 def load_users():
-    """Загружает пользователей из Google Sheets"""
     try:
-        return gsheets_storage.load_data("users")
+        if not os.path.exists(USERS_FILE):
+            return {}
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
     except Exception as e:
-        logging.error(f"❌ Ошибка загрузки users: {e}")
+        logging.error(f"Ошибка загрузки users: {e}")
         return {}
 
 def save_users(users):
-    """Сохраняет пользователей в Google Sheets"""
     try:
-        return gsheets_storage.save_data("users", users)
+        with open(USERS_FILE, "w") as f:
+            json.dump(users, f, indent=4)
     except Exception as e:
-        logging.error(f"❌ Ошибка сохранения users: {e}")
-        return False
+        logging.error(f"Ошибка сохранения users: {e}")
 
-async def get_faceit_stats(steam_id):
-    url = f"https://faceitfinder.com/profile/{steam_id}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                return None
-            html = await resp.text()
-            soup = BeautifulSoup(html, "html.parser")
+def load_events():
+    try:
+        if not os.path.exists(EVENTS_FILE):
+            return {}
+        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            return json.loads(content) if content else {}
+    except Exception as e:
+        logging.error(f"Ошибка загрузки events: {e}")
+        return {}
 
-            steam_name_tag = soup.select_one(".account-steam-name span")
-            steam_name = steam_name_tag.text.strip() if steam_name_tag else "?"
+def save_events(events):
+    try:
+        with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(events, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения events: {e}")
 
-            cs_hours_tag = soup.select_one("li.tick:-soup-contains('CS total hours') span")
-            cs_hours = cs_hours_tag.text.strip() if cs_hours_tag else "?"
+def load_memory():
+    try:
+        if not os.path.exists(MEMORY_FILE):
+            return {}
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            return json.loads(content) if content else {}
+    except Exception as e:
+        logging.error(f"Ошибка загрузки memory: {e}")
+        return {}
 
-            faceit_nick_tag = soup.select_one(".account-faceit-title-username")
-            faceit_nick = faceit_nick_tag.text.strip() if faceit_nick_tag else "?"
+def save_memory(memory):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения memory: {e}")
 
-            faceit_level_tag = soup.select_one(".account-faceit-level img")
-            if faceit_level_tag:
-                alt_text = faceit_level_tag.get("alt", "")
-                faceit_level = next((s for s in alt_text.split() if s.isdigit()), "?")
-            else:
-                faceit_level = "?"
+# ==================== ИНИЦИАЛИЗАЦИЯ ДАННЫХ ====================
+cs2_events = load_events()
+user_memory = load_memory()
 
-            stats_tags = soup.select(f"#faceitbase_{steam_id} div.account-faceit-stats-single")
-            stats = {}
-            for tag in stats_tags:
-                key, value = tag.text.split(":")
-                stats[key.strip()] = value.strip()
-
-            more_stats_tags = soup.select(f"#faceitmore_{steam_id} div.account-faceit-stats-single")
-            for tag in more_stats_tags:
-                key, value = tag.text.split(":")
-                stats[key.strip()] = value.strip()
-
-            return {
-                "steam_name": steam_name,
-                "cs_hours": cs_hours,
-                "faceit_nick": faceit_nick,
-                "faceit_level": faceit_level,
-                **stats
-            }
-
-
-
+# ==================== КЛАВИАТУРЫ ====================
 cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Отмена")]],
     resize_keyboard=True,
     one_time_keyboard=True
 )
 
-commands_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Создать сбор на CS2")],
-        [KeyboardButton(text="Команды")]
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=False
-)
-
-
-def load_events():
-    """Загружает события из Google Sheets"""
-    try:
-        return gsheets_storage.load_data("events")
-    except Exception as e:
-        logging.error(f"❌ Ошибка загрузки events: {e}")
-        return {}
-
-def save_events():
-    """Сохраняет события в Google Sheets"""
-    try:
-        return gsheets_storage.save_data("events", cs2_events)
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения events: {e}")
-        return False
-
-
-cs2_events = load_events()
-MEMORY_FILE = "user_memory.json"
-
-
-
-def load_memory():
-    """Загружает память из Google Sheets"""
-    try:
-        return gsheets_storage.load_data("memory")
-    except Exception as e:
-        logging.error(f"❌ Ошибка загрузки memory: {e}")
-        return {}
-
-def save_memory(memory):
-    """Сохраняет память в Google Sheets"""
-    try:
-        return gsheets_storage.save_data("memory", memory)
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения memory: {e}")
-        return False
-
-
-user_memory = load_memory()
-
-
-
+# ==================== ШУТКИ ====================
 JOKES = [
     "Ты в CS2 как экономика России — стабильно 0/15/3.",
     "Когда ты говоришь 'я саппорт' — вся команда держит дым, брат.",
@@ -612,261 +263,274 @@ JOKES = [
     "Твой вклад в победу как мотивация учиться в воскресенье — его нет."
 ]
 
-
-
-@dp.message(lambda message: message.text == "Создать сбор на CS2")
-async def ask_time(message: types.Message):
-    await message.answer(
-        "Напиши время сбора в формате ЧЧ:ММ, например 20:30",
-        reply_markup=cancel_keyboard
-    )
-    cs2_events[message.from_user.id] = {
-        "waiting_for_time": True,
-        "chat_id": message.chat.id,
-        "user_id": message.from_user.id
-    }
-    save_events()
-
-@dp.message(lambda message: message.from_user.id in cs2_events and cs2_events[message.from_user.id].get("waiting_for_time"))
-async def handle_event_time(message: types.Message):
-    user_event = cs2_events.get(message.from_user.id)
-    if not user_event or not user_event.get("waiting_for_time"):
-        return 
-
-    if message.text.lower() == "отмена":
-        cs2_events.pop(message.from_user.id, None)
-        save_events()
-        await message.reply("❌ Создание сбора отменено.", reply_markup=commands_keyboard)
-        return
-
-    time_text = message.text.strip()
+# ==================== FACEIT API ====================
+async def get_faceit_stats(steam_id):
     try:
-        hh, mm = map(int, time_text.split(":"))
-        assert 0 <= hh < 24 and 0 <= mm < 60
-    except:
-        await message.reply("Неверный формат! Используй ЧЧ:ММ или нажми 'Отмена'.")
-        return
+        url = f"https://faceitfinder.com/profile/{steam_id}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logging.error(f"FaceitFinder вернул статус: {resp.status}")
+                    return None
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
 
-    user_event["waiting_for_time"] = False
-    user_event["time"] = f"{hh:02d}:{mm:02d}"
-    save_events()
-    await message.reply(f"✅ Сбор на CS2 назначен на {hh:02d}:{mm:02d}!", reply_markup=commands_keyboard)
+                # Более надежное извлечение основных данных
+                steam_name = soup.select_one(".account-steam-name span")
+                cs_hours = soup.select_one("li.tick:-soup-contains('CS total hours') span")
+                faceit_nick = soup.select_one(".account-faceit-title-username")
+                faceit_level = soup.select_one(".account-faceit-level img")
 
-    asyncio.create_task(check_event(user_event["chat_id"], hh, mm))
+                # Улучшенное извлечение статистики
+                stats = {}
+                
+                # Способ 1: Поиск по классам статистики
+                stats_tags = soup.select("div.account-faceit-stats-single")
+                for tag in stats_tags:
+                    text = tag.get_text(strip=True)
+                    if ":" in text:
+                        key, value = text.split(":", 1)
+                        stats[key.strip()] = value.strip()
+                
+                # Способ 2: Поиск по конкретным меткам
+                stat_labels = ["Matches", "Wins", "Losses", "Win Rate", "Win %", "K/D", "K/D Ratio", "ELO"]
+                for label in stat_labels:
+                    element = soup.find(string=re.compile(f"{label}", re.IGNORECASE))
+                    if element:
+                        parent = element.find_parent()
+                        if parent:
+                            value = parent.get_text().split(":")[-1].strip()
+                            stats[label] = value
 
-@dp.message(F.text == "/stats")
-async def stats_command(message: Message):
-    users = load_users()
-    tg_id = str(message.from_user.id)
-    if tg_id not in users:
-        await message.reply("Вы не привязали SteamID. Используйте /bind <SteamID64>")
-        return
+                # Нормализация ключей статистики
+                normalized_stats = {}
+                key_mapping = {
+                    "Win Rate": "Winrt",
+                    "Win %": "Winrt", 
+                    "Winrate": "Winrt",
+                    "K/D Ratio": "K/D",
+                    "K/D ": "K/D"
+                }
+                
+                for key, value in stats.items():
+                    normalized_key = key_mapping.get(key, key)
+                    normalized_stats[normalized_key] = value
 
-    steam_id = users[tg_id]["steam_id"]
-    stats = await get_faceit_stats(steam_id)
-    if not stats:
-        await message.reply("Не удалось получить статистику.")
-        return
+                # Логируем для отладки
+                logging.info(f"Извлеченная статистика для {steam_id}: {normalized_stats}")
 
-    text = (
-        f"Steam: {stats['steam_name']}\n"
-        f"CS total hours: {stats['cs_hours']}\n"
-        f"Faceit: {stats['faceit_nick']}\n"
-        f"Level: {stats['faceit_level']}\n"
-        f"Matches: {stats.get('Matches','?')}\n"
-        f"ELO: {stats.get('ELO','?')}\n"
-        f"K/D: {stats.get('K/D','?')}\n"
-        f"Winrate: {stats.get('Winrt','?')}\n"
-        f"Wins: {stats.get('Wins','?')}\n"
-        f"HS: {stats.get('HS','?')}\n"
-    )
+                return {
+                    "steam_name": steam_name.text.strip() if steam_name else "?",
+                    "cs_hours": cs_hours.text.strip() if cs_hours else "?",
+                    "faceit_nick": faceit_nick.text.strip() if faceit_nick else "?",
+                    "faceit_level": next((s for s in faceit_level.get("alt", "").split() if s.isdigit()), "?") if faceit_level else "?",
+                    **normalized_stats
+                }
+    except Exception as e:
+        logging.error(f"Ошибка получения статистики Faceit: {e}")
+        return None
 
-    await message.reply(text)
+# ==================== МОНИТОРИНГ КАНАЛА ====================
+def create_post_id(post):
+    text_hash = hash(post['text'][:100] if post['text'] else "media") % 10000
+    return f"{post['time']}_{text_hash}"
 
-@dp.message(F.text.startswith("/bind"))
-async def bind_steam(message: Message):
-    args = message.text.split()
-    if len(args) != 2:
-        await message.reply("Использование: /bind <SteamID64>")
-        return
-
-    steam_id = args[1]
-    tg_id = str(message.from_user.id)
-
-    users = load_users()
-
-    stats = await get_faceit_stats(steam_id)
-    faceit_nick = stats["faceit_nick"] if stats else "Неизвестно"
-
-    users[tg_id] = {
-        "steam_id": steam_id,
-        "faceit_nick": faceit_nick
+async def get_telegram_posts():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(TELEGRAM_CHANNEL_URL, headers=headers) as response:
+                if response.status != 200:
+                    return None
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                messages = soup.find_all('div', class_='tgme_widget_message')
+                posts = []
+                
+                for message in messages:
+                    try:
+                        text_element = message.find('div', class_='tgme_widget_message_text')
+                        post_text = text_element.get_text(strip=True, separator='\n') if text_element else ""
+                        
+                        time_element = message.find('time', class_='time')
+                        post_time = time_element['datetime'] if time_element and 'datetime' in time_element.attrs else None
+                        
+                        post_link = message.find('a', class_='tgme_widget_message_date')
+                        post_url = post_link['href'] if post_link and 'href' in post_link.attrs else None
 
-    save_users(users)
-    await message.reply(
-        f"✅ Привязан SteamID: {steam_id}\n"
-        f"Faceit ник: {faceit_nick}\n"
-        f"Telegram ID: {tg_id}"
-    )
+                        # Фото
+                        photo_urls = []
+                        for photo in message.find_all('a', class_='tgme_widget_message_photo_wrap'):
+                            if 'style' in photo.attrs:
+                                match = re.search(r"background-image:url\('([^']+)'\)", photo['style'])
+                                if match:
+                                    photo_urls.append(match.group(1))
 
-@dp.message(Command("clear_events"))
-async def clear_events(message: types.Message):
-    cs2_events.clear()
-    save_events()
-    await message.reply("🗑 Все события очищены.", reply_markup=commands_keyboard)
+                        # Видео
+                        video_urls = [video['src'] for video in message.find_all('video', class_='tgme_widget_message_video') if video.get('src')]
 
-@dp.message(Command("start"))
-async def start_command(message: Message):
-    chat_id = message.chat.id
-    user = message.from_user.username or f"{message.from_user.first_name} ({message.from_user.id})"
-    logging.info("Got message in chat %s from %s", chat_id, user)
-    await message.reply(f"chat_id = `{chat_id}`")
-    await message.answer("Привет! Иди нахуй, я занят.", reply_markup=commands_keyboard)
+                        # Документы
+                        documents = []
+                        for doc in message.find_all('a', class_='tgme_widget_message_document_wrap'):
+                            doc_url = doc.get('href', '')
+                            doc_title = doc.find('div', class_='tgme_widget_message_document_title')
+                            documents.append({
+                                'url': doc_url,
+                                'title': doc_title.text.strip() if doc_title else "Документ"
+                            })
 
-@dp.message(Command("list_all_stats"))
-async def list_all_stats(message: types.Message):
-    users = load_users()
-    if not users:
-        await message.reply("Пользователей пока нет.")
+                        if (post_text or photo_urls or video_urls or documents) and post_time:
+                            post_data = {
+                                'text': post_text,
+                                'time': post_time,
+                                'photo_urls': photo_urls,
+                                'video_urls': video_urls,
+                                'documents': documents,
+                                'url': post_url,
+                                'is_reply': bool(message.find('a', class_='tgme_widget_message_reply'))
+                            }
+                            post_data['id'] = create_post_id(post_data)
+                            posts.append(post_data)
+                            
+                    except Exception as e:
+                        continue
+                
+                return posts
+                
+    except Exception as e:
+        logging.error(f"Ошибка парсинга канала: {e}")
+        return None
+
+async def download_media(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Referer": "https://t.me/"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=30) as response:
+                return await response.read() if response.status == 200 else None
+    except Exception:
+        return None
+
+async def send_telegram_post(post):
+    try:
+        clean_text = clean_markdown_text(post['text']) if post['text'] else ""
+        escaped_text = escape_markdown_v2(clean_text)
+        
+        caption = "📢 *Новый пост из канала*\n\n"
+        
+        if clean_text:
+            text_preview = escaped_text[:800] + ("\\.\\.\\." if len(clean_text) > 800 else "")
+            caption += text_preview
+        
+        if post['url']:
+            escaped_url = escape_markdown_v2(post['url'])
+            caption += f"\n\n[Ссылка на пост]({escaped_url})"
+
+        target_chat_id = TARGET_CHAT_ID
+        message_thread_id = TOPIC_IDS["NEWS_CHAT"]
+
+        # Отправка медиа
+        photo_urls = [normalize_url(url) for url in post['photo_urls']]
+        video_urls = [normalize_url(url) for url in post['video_urls']]
+        
+        if photo_urls:
+            if len(photo_urls) == 1:
+                photo_data = await download_media(photo_urls[0])
+                if photo_data:
+                    await bot.send_photo(
+                        chat_id=target_chat_id,
+                        message_thread_id=message_thread_id,
+                        photo=BufferedInputFile(photo_data, "photo.jpg"),
+                        caption=caption,
+                        parse_mode="MarkdownV2"
+                    )
+            else:
+                media_group = []
+                for i, url in enumerate(photo_urls[:10]):
+                    photo_data = await download_media(url)
+                    if photo_data:
+                        media = InputMediaPhoto(
+                            media=BufferedInputFile(photo_data, f"photo_{i}.jpg"),
+                            caption=caption if i == 0 else None,
+                            parse_mode="MarkdownV2" if i == 0 else None
+                        )
+                        media_group.append(media)
+                
+                if media_group:
+                    await bot.send_media_group(
+                        chat_id=target_chat_id,
+                        message_thread_id=message_thread_id,
+                        media=media_group
+                    )
+        
+        elif video_urls:
+            video_data = await download_media(video_urls[0])
+            if video_data:
+                await bot.send_video(
+                    chat_id=target_chat_id,
+                    message_thread_id=message_thread_id,
+                    video=BufferedInputFile(video_data, "video.mp4"),
+                    caption=caption,
+                    parse_mode="MarkdownV2"
+                )
+        
+        elif clean_text:
+            await bot.send_message(
+                chat_id=target_chat_id,
+                message_thread_id=message_thread_id,
+                text=caption,
+                parse_mode="MarkdownV2",
+                disable_web_page_preview=False
+            )
+        
+        logging.info("✅ Новый пост отправлен")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка отправки поста: {e}")
+        return False
+
+async def check_telegram_channel():
+    posts = await get_telegram_posts()
+    if not posts:
         return
-
-    msg = "📊 Статистика всех привязанных пользователей:\n\n"
-
-    for tg_id, info in users.items():
-        try:
-            member = await bot.get_chat_member(message.chat.id, int(tg_id))
-            username = member.user.username or f"{member.user.first_name} ({tg_id})"
-        except:
-            username = f"Пользователь {tg_id}"
-
-        steam_id = info["steam_id"]
-        stats = await get_faceit_stats(steam_id)
-        if not stats:
-            msg += f"{username}: Не удалось получить статистику.\n\n"
+    
+    last_post_time, processed_posts = load_last_post()
+    new_posts_found = 0
+    latest_post_time = last_post_time
+    
+    for post in posts:
+        if post['id'] in processed_posts:
             continue
 
-        msg += (
-            f"{username}:\n"
-            f"Steam: {stats['steam_name']}\n"
-            f"CS total hours: {stats['cs_hours']}\n"
-            f"Faceit: {stats['faceit_nick']}\n"
-            f"Level: {stats['faceit_level']}\n"
-            f"Matches: {stats.get('Matches','?')}\n"
-            f"ELO: {stats.get('ELO','?')}\n"
-            f"K/D: {stats.get('K/D','?')}\n"
-            f"Winrate: {stats.get('Winrt','?')}\n"
-            f"Wins: {stats.get('Wins','?')}\n"
-            f"HS: {stats.get('HS','?')}\n\n"
-        )
+        if last_post_time is None or post['time'] > last_post_time:
+            success = await send_telegram_post(post)
+            if success:
+                processed_posts.add(post['id'])
+                if latest_post_time is None or post['time'] > latest_post_time:
+                    latest_post_time = post['time']
+                new_posts_found += 1
+                await asyncio.sleep(1)
+    
+    if new_posts_found > 0:
+        save_last_post(latest_post_time, processed_posts)
+        logging.info(f"✅ Обработано {new_posts_found} новых постов")
 
-    await message.reply(msg)
+async def scheduled_channel_check():
+    while True:
+        await check_telegram_channel()
+        await asyncio.sleep(CHECK_INTERVAL)
 
-@dp.message(lambda message: message.text == "Команды")
-async def show_commands(message: types.Message):
-    text = (
-        "Доступные команды:\n"
-        "Обращение к боту через хуесос или габен\n"
-        "/bind <SteamID64> — привязать SteamID к Telegram\n"
-        "/stats — получить Faceit CS2 статистику\n"
-        "/list_all_stats — получить Faceit CS2 статистику по всем игрокам\n"
-        "/events — показать текущие сборы\n"
-        "/clear_events — удалить все события"
-    )
-    await message.reply(text, reply_markup=commands_keyboard)
-
-@dp.message(Command("events"))
-async def show_events(message: Message):
-    if not cs2_events:
-        await message.reply("Событий пока нет.")
-        return
-
-    msg = "Текущие события:\n"
-    for user_id, ev in cs2_events.items():
-        status = "Ждём время" if ev.get("waiting_for_time") else f"Время: {ev.get('time')}"
-        msg += f"- Пользователь {user_id}: {status}\n"
-
-    clear_keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Очистить события")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-    await message.reply(msg, reply_markup=clear_keyboard)
-
-@dp.message()
-async def handle_message(message: Message):
-    if not message.text:
-        return
-
-    if message.text == "Очистить события":
-        cs2_events.clear()
-        save_events()
-        await message.reply("🗑 Все события очищены.", reply_markup=commands_keyboard)
-        return
-
-    user_id = str(message.from_user.id)
-    text = message.text.strip().lower()
-
-    # 😂 Анекдоты и шутки
-    if any(trigger in text for trigger in JOKE_TRIGGERS):
-        await message.reply(random.choice(JOKES), reply_markup=commands_keyboard)
-        return
-
-    # 🎯 Проверяем, что в сообщении есть триггер
-    if not any(trigger in text for trigger in TRIGGER_WORDS):
-        return
-
-    users = load_users()
-    user_stats = None
-    if user_id in users:
-        steam_id = users[user_id]["steam_id"]
-        user_stats = await get_faceit_stats(steam_id)
-
-    # 🧠 Загружаем историю сообщений пользователя
-    history = user_memory.get(user_id, [])
-    history.append({"role": "user", "content": text})
-    history = history[-5:]  # храним последние 5 сообщений
-
-    # ⚡ Генерируем ответ Mistral
-    def mistral_sync():
-        return client.chat.complete(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "Ты запуганный, опущенный бот, как петух на зоне, говоришь по-русски с небольшим количеством элементов геймерского сленга, также употребляешь русские маты. "
-                    "Ты также получаешь статистику из Faceit и можешь её использовать в разговорах только если попросят, а не в каждом сообщении. ТОЛЬКО КОГДА ПОПРОСЯТ! "
-                    f"Статистика пользователя: {user_stats if user_stats else 'Нет привязанного SteamID или статистика недоступна.'} "
-                    "Тебя зовут Габен, ты не пытешься обидеть пользователя, он для тебя как блатные на зоне, а ты их прислуга. "
-                    "Твои ответы короткие, с уважением ироничным: немного иронии, немного уважения. "
-                )},
-                *history
-            ]
-        )
-
-    try:
-        response = await asyncio.to_thread(mistral_sync)
-        bot_reply = response.choices[0].message.content
-
-        # 💾 Обновляем память
-        history.append({"role": "assistant", "content": bot_reply})
-        user_memory[user_id] = history
-        save_memory(user_memory)
-
-        # Пробуем MarkdownV2
-        try:
-            await message.reply(bot_reply, parse_mode="Markdown", reply_markup=commands_keyboard)
-        except Exception as e:
-            logging.warning(f"⚠️ MarkdownV2 не сработал, отправляем без разметки: {e}")
-            await message.reply(bot_reply, parse_mode=None, reply_markup=commands_keyboard)
-            
-    except Exception as e:
-        logging.error(f"❌ Ошибка при работе с Mistral: {e}")
-        await message.reply("❌ Произошла ошибка при генерации ответа.", reply_markup=commands_keyboard)
-
-
-
+# ==================== СОБЫТИЯ CS2 ====================
 async def check_event(chat_id, hh, mm):
+    """Запускает напоминания о событии CS2"""
     event_time = datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
     now = datetime.now()
 
@@ -888,22 +552,354 @@ async def check_event(chat_id, hh, mm):
 
         await asyncio.sleep(30)
 
-async def keep_alive():
-    """Периодическая активность чтобы сервис не засыпал"""
-    while True:
-        await asyncio.sleep(300)  # Каждые 5 минут
-        logging.info("🤖 Bot keep-alive - service is active")
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+@dp.message(Command("start"))
+async def start_command(message: Message):
+    if not is_allowed_topic(message):
+        return
+        
+    await message.reply(
+        f"**Информация о чате:**\n"
+        f"💬 ID чата: `{message.chat.id}`\n"
+        f"📌 ID темы: `{message.message_thread_id}`\n"
+        f"👤 Пользователь: {message.from_user.username or message.from_user.first_name}",
+        parse_mode="Markdown"
+    )
 
+async def show_commands(message: types.Message):
+        
+    text = (
+        "🤖 *ДОСТУПНЫЕ КОМАНДЫ*\n\n"
+        
+        "👋 *Основные*\n"
+        "▫️ /start \\- Запустить бота\n"
+        "▫️ /stats \\- Моя статистика Faceit\n"
+        "▫️ команды \\- Этот список\n\n"
+        
+        "📊 *Статистика*\n"  
+        "▫️ /list\\_all\\_stats \\- Статистика всех игроков\n"
+        "▫️ /bind STEAM\\_ID \\- Привязать Steam аккаунт\n\n"
+        
+        "🎮 *События CS2*\n"
+        "▫️ /create\\_event \\- Создать новое событие\n"
+        "▫️ /events \\- Показать текущие сборы\n"
+        "▫️ /clear\\_events \\- Очистить все события\n\n"
+        
+        "⚙️ *Управление темами*\n"
+        "▫️ /setup\\_topics \\- Настроить ID тем\n"
+        "▫️ /topics\\_info \\- Информация о темах\n"
+        "▫️ /get\\_topic \\- Получить ID темы\n\n"
+        
+        "😄 *Взаимодействие*\n"
+        "▫️ Напиши 'габен' или 'хуесос' для общения\n"
+        "▫️ Напиши 'анекдот', 'шутка' для шутки"
+    )
+    
+    await message.reply(text, parse_mode="MarkdownV2")
+
+@dp.message(Command("create_event"))
+async def create_event_command(message: types.Message):
+    if not is_allowed_topic(message):
+        return
+        
+    await message.answer(
+        "Напиши время сбора в формате ЧЧ:ММ, например 20:30",
+        reply_markup=cancel_keyboard
+    )
+    cs2_events[message.from_user.id] = {
+        "waiting_for_time": True,
+        "chat_id": message.chat.id,
+        "user_id": message.from_user.id
+    }
+    save_events(cs2_events)
+
+@dp.message(lambda message: message.from_user.id in cs2_events and cs2_events[message.from_user.id].get("waiting_for_time"))
+async def handle_event_time(message: types.Message):
+    user_event = cs2_events.get(message.from_user.id)
+    if not user_event:
+        return
+
+    if message.text and message.text.lower() == "отмена":
+        cs2_events.pop(message.from_user.id, None)
+        save_events(cs2_events)
+        await message.reply("❌ Создание сбора отменено.")
+        return
+
+    try:
+        hh, mm = map(int, message.text.strip().split(":"))
+        assert 0 <= hh < 24 and 0 <= mm < 60
+    except:
+        await message.reply("Неверный формат! Используй ЧЧ:ММ")
+        return
+
+    user_event["waiting_for_time"] = False
+    user_event["time"] = f"{hh:02d}:{mm:02d}"
+    save_events(cs2_events)
+    await message.reply(f"✅ Сбор на CS2 назначен на {hh:02d}:{mm:02d}!")
+    asyncio.create_task(check_event(user_event["chat_id"], hh, mm))
+
+@dp.message(Command("stats"))
+async def stats_command(message: Message):
+    if not is_allowed_topic(message):
+        return
+        
+    users = load_users()
+    tg_id = str(message.from_user.id)
+    
+    if tg_id not in users:
+        await message.reply("Используйте /bind <SteamID64> для привязки")
+        return
+
+    stats = await get_faceit_stats(users[tg_id]["steam_id"])
+    if not stats:
+        await message.reply("Не удалось получить статистику.")
+        return
+
+    # Обработка WinRate с разными форматами
+    winrate = stats.get('Winrt', '?')
+    if winrate != '?':
+        # Убираем возможные лишние символы процента
+        winrate = winrate.replace('%', '').strip()
+        if winrate.replace('.', '').isdigit():
+            winrate = f"{winrate}%"
+
+    text = (
+        f"Steam: {stats['steam_name']}\n"
+        f"CS hours: {stats['cs_hours']}\n"
+        f"Faceit: {stats['faceit_nick']}\n"
+        f"Level: {stats['faceit_level']}\n"
+        f"Matches: {stats.get('Matches','?')}\n"
+        f"ELO: {stats.get('ELO','?')}\n"
+        f"K/D: {stats.get('K/D','?')}\n"
+        f"Winrate: {winrate}"
+    )
+    await message.reply(text)
+
+@dp.message(Command("bind"))
+async def bind_steam(message: Message):
+    if not is_allowed_topic(message):
+        return
+        
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Использование: /bind <SteamID64>")
+        return
+
+    steam_id = args[1]
+    users = load_users()
+    
+    stats = await get_faceit_stats(steam_id)
+    users[str(message.from_user.id)] = {
+        "steam_id": steam_id,
+        "faceit_nick": stats["faceit_nick"] if stats else "Неизвестно"
+    }
+    
+    save_users(users)
+    await message.reply(f"✅ Привязан SteamID: {steam_id}")
+
+@dp.message(Command("list_all_stats"))
+async def list_all_stats(message: types.Message):
+    if not is_allowed_topic(message):
+        return
+        
+    users = load_users()
+    if not users:
+        await message.reply("Пользователей пока нет.")
+        return
+
+    msg = "📊 *Статистика всех игроков:*\n\n"
+    for tg_id, info in users.items():
+        stats = await get_faceit_stats(info["steam_id"])
+        if stats:
+            # Обработка WinRate
+            winrate = stats.get('Winrt', '?')
+            if winrate != '?':
+                winrate = winrate.replace('%', '').strip()
+                if winrate.replace('.', '').isdigit():
+                    winrate = f"{winrate}%"
+                    
+            msg += f"*{escape_markdown_v2(info['faceit_nick'])}:*\n"
+            msg += f"• Level: `{stats['faceit_level']}` • ELO: `{stats.get('ELO','?')}`\n"
+            msg += f"• K/D: `{stats.get('K/D','?')}` • WinRate: `{winrate}`\n\n"
+
+    await message.reply(msg, parse_mode="Markdown")
+
+@dp.message(Command("events"))
+async def show_events(message: Message):
+    if not is_allowed_topic(message):
+        return
+        
+    if not cs2_events:
+        await message.reply("Событий пока нет.")
+        return
+
+    msg = "Текущие события:\n"
+    for user_id, ev in cs2_events.items():
+        status = "Ждём время" if ev.get("waiting_for_time") else f"Время: {ev.get('time')}"
+        msg += f"- Пользователь {user_id}: {status}\n"
+
+    await message.reply(msg)
+
+@dp.message(Command("clear_events"))
+async def clear_events(message: types.Message):
+    if not is_allowed_topic(message):
+        return
+        
+    cs2_events.clear()
+    save_events(cs2_events)
+    await message.reply("🗑 Все события очищены.")
+
+# ==================== КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ ТЕМАМИ ====================
+
+@dp.message(Command("get_topic"))
+async def get_topic_info(message: Message):
+    """Команда для получения информации о теме"""
+    topic_id = message.message_thread_id
+    chat_id = message.chat.id
+    
+    if topic_id:
+        await message.reply(
+            f"**Информация о теме:**\n"
+            f"🆔 ID темы: `{topic_id}`\n"
+            f"💬 ID чата: `{chat_id}`",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.reply("❌ Это сообщение не в теме (основной чат)")
+
+@dp.message(Command("setup_topics"))
+async def setup_topics_command(message: Message):
+    """Команда для настройки ID тем"""
+    if message.from_user.id not in [1089779100, 1404218084]:
+        await message.reply("❌ Только админы могут настраивать темы")
+        return
+    
+    args = message.text.split()
+    
+    if len(args) != 4:
+        await message.reply(
+            "**Использование:**\n"
+            "`/setup_topics <human_topic_id> <bot_topic_id> <news_topic_id>`\n\n"
+            "💡 Чтобы получить ID темы, напиши `/get_topic` в нужной теме"
+        )
+        return
+    
+    try:
+        TOPIC_IDS["HUMAN_CHAT"] = int(args[1])
+        TOPIC_IDS["BOT_CHAT"] = int(args[2]) 
+        TOPIC_IDS["NEWS_CHAT"] = int(args[3])
+        
+        await message.reply(
+            "✅ **Темы настроены!**\n\n"
+            f"💬 Общий чат: `{TOPIC_IDS['HUMAN_CHAT']}`\n"
+            f"🤖 Бот Габен: `{TOPIC_IDS['BOT_CHAT']}`\n" 
+            f"📢 Новости CS2: `{TOPIC_IDS['NEWS_CHAT']}`"
+        )
+        
+    except ValueError:
+        await message.reply("❌ ID тем должны быть числами!")
+
+@dp.message(Command("topics_info"))
+async def topics_info_command(message: Message):
+    """Показывает текущие настройки тем"""
+    info_text = (
+        "**Текущие настройки тем:**\n\n"
+        f"💬 Общий чат: `{TOPIC_IDS['HUMAN_CHAT']}`\n"
+        f"🤖 Бот Габен: `{TOPIC_IDS['BOT_CHAT']}`\n"
+        f"📢 Новости CS2: `{TOPIC_IDS['NEWS_CHAT']}`\n\n"
+        f"🆔 Текущая тема: `{message.message_thread_id}`\n"
+        f"✅ Бот отвечает здесь: **{'ДА' if is_allowed_topic(message) else 'НЕТ'}**"
+    )
+    
+    await message.reply(info_text, parse_mode="Markdown")
+
+# ==================== ОСНОВНОЙ ОБРАБОТЧИК ====================
+@dp.message()
+async def handle_message(message: Message):
+    if not is_allowed_topic(message) or not message.text:
+        return
+
+    text = message.text.lower().strip()
+
+    if "команды" in text:
+        await show_commands(message)
+        return
+
+    # Очистка событий
+    if text == "очистить события":
+        cs2_events.clear()
+        save_events(cs2_events)
+        await message.reply("🗑 Все события очищены.")
+        return
+
+    # Шутки
+    if any(trigger in text for trigger in JOKE_TRIGGERS):
+        await message.reply(random.choice(JOKES))
+        return
+
+    # AI-ответы
+    if not any(trigger in text for trigger in TRIGGER_WORDS):
+        return
+
+    user_id = str(message.from_user.id)
+    users = load_users()
+    user_stats = None
+    
+    if user_id in users:
+        user_stats = await get_faceit_stats(users[user_id]["steam_id"])
+
+    history = user_memory.get(user_id, [])
+    history.append({"role": "user", "content": text})
+    history = history[-5:]
+
+    try:
+        response = await asyncio.to_thread(
+            lambda: client.chat.complete(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": (
+                    "Ты запуганный, опущенный бот, как петух на зоне, говоришь по-русски с небольшим количеством элементов геймерского сленга, также употребляешь русские маты. "
+                    "Ты также получаешь статистику из Faceit и можешь её использовать в разговорах только если попросят, а не в каждом сообщении. ТОЛЬКО КОГДА ПОПРОСЯТ! "
+                    f"Статистика пользователя: {user_stats if user_stats else 'Нет привязанного SteamID или статистика недоступна.'} "
+                    "Тебя зовут Габен, ты не пытешься обидеть пользователя, он для тебя как блатные на зоне, а ты их прислуга. "
+                    "Твои ответы короткие, с уважением ироничным: немного иронии, немного уважения. "
+                    f"Сейчас ты отвечаешь в теме для бота. Отвечай только когда тебя вызывают по имени."
+               )},
+                    *history
+                ]
+            )
+        )
+        
+        bot_reply = response.choices[0].message.content
+        history.append({"role": "assistant", "content": bot_reply})
+        user_memory[user_id] = history
+        save_memory(user_memory)
+
+        await message.reply(bot_reply, parse_mode="Markdown")
+            
+    except Exception as e:
+        logging.error(f"Ошибка Mistral: {e}")
+        await message.reply("❌ Ошибка генерации ответа.")
+
+# ==================== ЗАПУСК ====================
 async def main():
+    # Создаем файлы если нет
+    for file, default in [(USERS_FILE, {}), (LAST_POST_FILE, {"last_post_time": None, "processed_posts": []}), 
+                         (EVENTS_FILE, {}), (MEMORY_FILE, {})]:
+        if not os.path.exists(file):
+            with open(file, "w", encoding="utf-8") as f:
+                json.dump(default, f, indent=2, ensure_ascii=False)
+
     # Отправляем сообщение о запуске
     try:
         await bot.send_message(
             chat_id=CHAT_ID, 
-            text="🚀 **Бот запущен!**\n\n"
+            text="🚀 **Бот запущен локально!**\n\n"
                  "✅ Мониторинг канала активирован\n"
                  "✅ Система событий работает\n"
                  "✅ Faceit статистика доступна\n"
-                 "✅ AI-помощник готов к работе",
+                 "✅ AI-помощник готов к работе\n"
+                 "✅ Локальные файлы памяти активны",
             parse_mode="Markdown"
         )
         logging.info("✅ Сообщение о запуске отправлено в чат")
@@ -912,20 +908,14 @@ async def main():
 
     # Запускаем мониторинг канала в фоне
     asyncio.create_task(scheduled_channel_check())
-
-    asyncio.create_task(keep_alive())
     
-    # Запускаем планировщик
-    scheduler = AsyncIOScheduler()
-    scheduler.start()
-
-    print("🟢 Бот запущен и работает...")
+    print("🟢 Бот запущен и работает локально...")
 
     await bot(DeleteWebhook(drop_pending_updates=True))
     
     try:
         # Старт бота
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except Exception as e:
         logging.error(f"❌ Ошибка при работе бота: {e}")
         # Отправляем сообщение об ошибке
@@ -953,23 +943,11 @@ async def main():
         print("🔴 Бот остановлен.")
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        print("⏹️ Бот остановлен вручную")
-    except Exception as e:
-        logging.error(f"❌ Критическая ошибка: {e}")
-    finally:
-        try:
-            loop.run_until_complete(bot.session.close())
-        except:
-            pass
-        loop.close()
-
+    asyncio.run(main())
 
 #"Ты токсичный, саркастичный бот, говоришь по-русски с небольшим количеством элементов геймерского сленга, также употребляешь русские маты. "
            #         "Ты также получаешь статистику из Faceit и можешь её использовать в разговорах только если попросят, а не в каждом сообщении. ТОЛЬКО КОГДА ПОПРОСЯТ! "
          #           f"Статистика пользователя: {user_stats if user_stats else 'Нет привязанного SteamID или статистика недоступна.'} "
          #           "Тебя зовут Габен, ты не пытешься обидеть пользователя, но говоришь всё как есть, без цензуры и чтобы было смешно. "
          #           "Твои ответы короткие, острые: немного рофла, немного боли. "
+
