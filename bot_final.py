@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 import html
 from mistralai import Mistral
+from gsheets_storage import gsheets_storage
 
 # ==================== КОНФИГУРАЦИЯ ====================
 # Получаем переменные окружения с Render
@@ -58,79 +59,35 @@ logging.basicConfig(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ НА RENDER ====================
-def get_file_path(filename):
-    """Получает корректный путь к файлу на Render"""
-    return filename  # На Render файлы в корне проекта
-
-def init_files():
-    """Инициализирует необходимые файлы если их нет"""
-    files_to_init = [LAST_POST_FILE, USERS_FILE, EVENTS_FILE, MEMORY_FILE]
-    
-    for file in files_to_init:
-        file_path = get_file_path(file)
-        if not os.path.exists(file_path):
-            logging.info(f"📁 Создаю файл: {file}")
-            try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    if file == LAST_POST_FILE:
-                        json.dump({"last_post_time": None, "processed_posts": []}, f, ensure_ascii=False, indent=2)
-                    elif file == USERS_FILE:
-                        # Начальные пользователи
-                        initial_users = {
-                            "1089779100": {"steam_id": "76561199045259245", "faceit_nick": "maclai23"},
-                            "1404218084": {"steam_id": "76561199441970331", "faceit_nick": "amebka111"},
-                            "881871844": {"steam_id": "76561198873916688", "faceit_nick": "soft_hyper"},
-                            "919046867": {"steam_id": "76561199069180401", "faceit_nick": "m6ntai"},
-                            "2033412443": {"steam_id": "76561199767276086", "faceit_nick": "Increble"}
-                        }
-                        json.dump(initial_users, f, ensure_ascii=False, indent=2)
-                    else:
-                        json.dump({}, f, ensure_ascii=False, indent=2)
-                logging.info(f"✅ Файл {file} создан успешно")
-            except Exception as e:
-                logging.error(f"❌ Ошибка создания файла {file}: {e}")
-        else:
-            logging.info(f"✅ Файл {file} уже существует")
-
-# Инициализируем файлы при запуске
-init_files()
 
 
 def load_last_post():
+    """Загружает данные о последнем посте из Google Sheets"""
     try:
-        file_path = get_file_path(LAST_POST_FILE)
-        if not os.path.exists(file_path):
+        data = gsheets_storage.load_data("last_post")
+        if not data:
             return None, set()
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                return None, set()
-                
-            data = json.loads(content)
-            last_post_time = data.get("last_post_time")
-            # Преобразуем список в множество
-            processed_posts_list = data.get("processed_posts", [])
-            processed_posts = set(processed_posts_list)  # ← ИСПРАВЛЕНИЕ ЗДЕСЬ
-            return last_post_time, processed_posts
-            
-    except (json.JSONDecodeError, KeyError) as e:
-        logging.warning(f"⚠️ Ошибка чтения файла {LAST_POST_FILE}: {e}. Создаю новый.")
-        save_last_post(None, set())
-        return None, set()
+        
+        last_post_time = data.get("last_post_time")
+        processed_posts_list = data.get("processed_posts", [])
+        processed_posts = set(processed_posts_list)
+        return last_post_time, processed_posts
+        
     except Exception as e:
-        logging.error(f"❌ Неизвестная ошибка при загрузке постов: {e}")
+        logging.error(f"❌ Ошибка загрузки last_post: {e}")
         return None, set()
-    
+
 def save_last_post(post_time, processed_posts):
-    file_path = get_file_path(LAST_POST_FILE)
-    with open(file_path, "w", encoding="utf-8") as f:
-        processed_posts_list = list(processed_posts)
-        json.dump({
+    """Сохраняет данные о последнем посте в Google Sheets"""
+    try:
+        data = {
             "last_post_time": post_time,
-            "processed_posts": processed_posts_list
-        }, f, ensure_ascii=False, indent=2)
+            "processed_posts": list(processed_posts)
+        }
+        return gsheets_storage.save_data("last_post", data)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения last_post: {e}")
+        return False
 
 def create_post_id(post):
     text_hash = hash(post['text'][:100] if post['text'] else "media") % 10000
@@ -475,17 +432,20 @@ async def send_text_fallback(text, url=None, doc_title=None, fallback=False):
         return False
 
 def load_users():
+    """Загружает пользователей из Google Sheets"""
     try:
-        file_path = get_file_path(USERS_FILE)
-        with open(file_path, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
+        return gsheets_storage.load_data("users")
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки users: {e}")
         return {}
 
 def save_users(users):
-    file_path = get_file_path(USERS_FILE)
-    with open(file_path, "w") as f:
-        json.dump(users, f, indent=4)
+    """Сохраняет пользователей в Google Sheets"""
+    try:
+        return gsheets_storage.save_data("users", users)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения users: {e}")
+        return False
 
 async def get_faceit_stats(steam_id):
     url = f"https://faceitfinder.com/profile/{steam_id}"
@@ -549,26 +509,21 @@ commands_keyboard = ReplyKeyboardMarkup(
 )
 
 
-
 def load_events():
-    file_path = get_file_path(EVENTS_FILE)
-    if os.path.exists(file_path):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if not content:
-                    return {}  # файл есть, но пустой
-                return json.loads(content)
-        except json.JSONDecodeError:
-            logging.warning(f"⚠️ Файл {EVENTS_FILE} повреждён — перезаписываю пустым.")
-            return {}
-    return {}
+    """Загружает события из Google Sheets"""
+    try:
+        return gsheets_storage.load_data("events")
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки events: {e}")
+        return {}
 
 def save_events():
-    file_path = get_file_path(EVENTS_FILE)
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(cs2_events, f, ensure_ascii=False, indent=2)
-
+    """Сохраняет события в Google Sheets"""
+    try:
+        return gsheets_storage.save_data("events", cs2_events)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения events: {e}")
+        return False
 
 
 cs2_events = load_events()
@@ -577,17 +532,20 @@ MEMORY_FILE = "user_memory.json"
 
 
 def load_memory():
-    file_path = get_file_path(MEMORY_FILE)
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    """Загружает память из Google Sheets"""
+    try:
+        return gsheets_storage.load_data("memory")
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки memory: {e}")
+        return {}
 
 def save_memory(memory):
-    file_path = get_file_path(MEMORY_FILE)
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(memory, f, ensure_ascii=False, indent=2)
-
+    """Сохраняет память в Google Sheets"""
+    try:
+        return gsheets_storage.save_data("memory", memory)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения memory: {e}")
+        return False
 
 
 user_memory = load_memory()
