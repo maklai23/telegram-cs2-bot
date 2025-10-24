@@ -5,6 +5,8 @@ import json
 import random
 import aiohttp
 import re
+import requests
+import base64
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -19,8 +21,8 @@ import html
 from mistralai import Mistral
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = "8023437078:AAFT5qCCe05oVgKgqaBZlbzuq1nd4wLizhM"
-MISTRAL_API_KEY = "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8023437078:AAFT5qCCe05oVgKgqaBZlbzuq1nd4wLizhM")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV")
 BOT_USERNAME = "team_spirt2_bot"
 
 # Константы
@@ -40,6 +42,82 @@ client = Mistral(api_key=MISTRAL_API_KEY)
 
 TRIGGER_WORDS = ["габен", "хуесос"]
 JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
+
+# ==================== GITHUB СИНХРОНИЗАЦИЯ ====================
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # формат: username/repo
+BACKUP_FILES = [USERS_FILE, EVENTS_FILE, MEMORY_FILE, LAST_POST_FILE]
+
+def backup_to_github():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    
+    try:
+        for filename in BACKUP_FILES:
+            if os.path.exists(filename):
+                with open(filename, "r", encoding="utf-8") as f:
+                    content = f.read()
+                
+                # Кодируем в base64 для GitHub API
+                encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+                
+                # Проверяем существует ли файл в репозитории
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+                headers = {
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                
+                response = requests.get(url, headers=headers)
+                
+                if response.status_code == 200:
+                    # Файл существует - обновляем
+                    sha = response.json()["sha"]
+                    data = {
+                        "message": f"Backup {filename}",
+                        "content": encoded_content,
+                        "sha": sha
+                    }
+                    requests.put(url, headers=headers, json=data)
+                else:
+                    # Файл не существует - создаем новый
+                    data = {
+                        "message": f"Initial backup {filename}",
+                        "content": encoded_content
+                    }
+                    requests.put(url, headers=headers, json=data)
+                    
+        logging.info("✅ Резервная копия создана в GitHub")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка backup в GitHub: {e}")
+        return False
+
+def restore_from_github():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    
+    try:
+        for filename in BACKUP_FILES:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+            headers = {
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                content = response.json()["content"]
+                decoded_content = base64.b64decode(content).decode("utf-8")
+                
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(decoded_content)
+                    
+        logging.info("✅ Данные восстановлены из GitHub")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка восстановления из GitHub: {e}")
+        return False
 
 # ==================== КОНФИГУРАЦИЯ ТЕМ ====================
 TOPIC_IDS = {
@@ -135,6 +213,7 @@ def save_last_post(post_time, processed_posts):
                 "last_post_time": post_time,
                 "processed_posts": list(processed_posts)
             }, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
     except Exception as e:
         logging.error(f"Ошибка сохранения last_post: {e}")
 
@@ -152,6 +231,8 @@ def save_users(users):
     try:
         with open(USERS_FILE, "w") as f:
             json.dump(users, f, indent=4)
+        # Автоматический backup в GitHub
+        asyncio.create_task(async_backup_to_github())
     except Exception as e:
         logging.error(f"Ошибка сохранения users: {e}")
 
@@ -170,6 +251,7 @@ def save_events(events):
     try:
         with open(EVENTS_FILE, "w", encoding="utf-8") as f:
             json.dump(events, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
     except Exception as e:
         logging.error(f"Ошибка сохранения events: {e}")
 
@@ -188,8 +270,13 @@ def save_memory(memory):
     try:
         with open(MEMORY_FILE, "w", encoding="utf-8") as f:
             json.dump(memory, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
     except Exception as e:
         logging.error(f"Ошибка сохранения memory: {e}")
+
+async def async_backup_to_github():
+    """Асинхронный backup в GitHub"""
+    await asyncio.get_event_loop().run_in_executor(None, backup_to_github)
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ДАННЫХ ====================
 cs2_events = load_events()
@@ -613,6 +700,23 @@ async def create_event_command(message: types.Message):
     }
     save_events(cs2_events)
 
+@dp.message(Command("backup"))
+async def backup_command(message: Message):
+    if not is_allowed_topic(message):
+        return
+        
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        await message.reply("❌ GitHub синхронизация не настроена")
+        return
+        
+    await message.reply("🔄 Создаю резервную копию...")
+    success = await async_backup_to_github()
+    
+    if success:
+        await message.reply("✅ Резервная копия создана в GitHub")
+    else:
+        await message.reply("❌ Ошибка создания резервной копии")
+
 @dp.message(lambda message: message.from_user.id in cs2_events and cs2_events[message.from_user.id].get("waiting_for_time"))
 async def handle_event_time(message: types.Message):
     user_event = cs2_events.get(message.from_user.id)
@@ -883,6 +987,24 @@ async def handle_message(message: Message):
 
 # ==================== ЗАПУСК ====================
 async def main():
+    # Импортируем keep_alive
+    from keep_alive import keep_alive
+    
+    # Запускаем веб-сервер для UptimeRobot
+    keep_alive()
+    
+    # Восстанавливаем данные из GitHub при запуске
+    if GITHUB_TOKEN and GITHUB_REPO:
+        await asyncio.get_event_loop().run_in_executor(None, restore_from_github)
+    
+    # Создаем файлы если нет (остальной код без изменений)
+    for file, default in [(USERS_FILE, {}), (LAST_POST_FILE, {"last_post_time": None, "processed_posts": []}), 
+                         (EVENTS_FILE, {}), (MEMORY_FILE, {})]:
+        if not os.path.exists(file):
+            with open(file, "w", encoding="utf-8") as f:
+                json.dump(default, f, indent=2, ensure_ascii=False)
+
+
     # Создаем файлы если нет
     for file, default in [(USERS_FILE, {}), (LAST_POST_FILE, {"last_post_time": None, "processed_posts": []}), 
                          (EVENTS_FILE, {}), (MEMORY_FILE, {})]:
