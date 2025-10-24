@@ -16,23 +16,29 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 import html
-
 from mistralai import Mistral
 
+# ==================== КОНФИГУРАЦИЯ ====================
+# Получаем переменные окружения с Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
+# Проверяем, что переменные загружены
+if not BOT_TOKEN or not MISTRAL_API_KEY:
+    logging.error("❌ Не найдены BOT_TOKEN или MISTRAL_API_KEY в переменных окружения!")
+    exit(1)
 
+# Остальные константы
 LAST_POST_FILE = "last_telegram_post.json"
 TELEGRAM_CHANNEL = "newcsgo"
 TELEGRAM_CHANNEL_URL = f"https://t.me/s/{TELEGRAM_CHANNEL}"
 CHECK_INTERVAL = 60
 
-MISTRAL_API_KEY = "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV"
-BOT_TOKEN = "8023437078:AAFT5qCCe05oVgKgqaBZlbzuq1nd4wLizhM"
 CHAT_ID = -4619177118
-
 TARGET_CHAT_ID = CHAT_ID
 USERS_FILE = "users.json"
 EVENTS_FILE = "events.json"
+MEMORY_FILE = "user_memory.json"
 
 MODEL = "mistral-medium-latest"
 client = Mistral(api_key=MISTRAL_API_KEY)
@@ -40,18 +46,64 @@ client = Mistral(api_key=MISTRAL_API_KEY)
 TRIGGER_WORDS = ["габен", "хуесос"]
 JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
 
-logging.basicConfig(level=logging.INFO)
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Для вывода в консоль Render
+    ]
+)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ НА RENDER ====================
+def get_file_path(filename):
+    """Получает корректный путь к файлу на Render"""
+    return filename  # На Render файлы в корне проекта
+
+def init_files():
+    """Инициализирует необходимые файлы если их нет"""
+    files_to_init = [LAST_POST_FILE, USERS_FILE, EVENTS_FILE, MEMORY_FILE]
+    
+    for file in files_to_init:
+        file_path = get_file_path(file)
+        if not os.path.exists(file_path):
+            logging.info(f"📁 Создаю файл: {file}")
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    if file == LAST_POST_FILE:
+                        json.dump({"last_post_time": None, "processed_posts": []}, f, ensure_ascii=False, indent=2)
+                    elif file == USERS_FILE:
+                        # Начальные пользователи
+                        initial_users = {
+                            "1089779100": {"steam_id": "76561199045259245", "faceit_nick": "maclai23"},
+                            "1404218084": {"steam_id": "76561199441970331", "faceit_nick": "amebka111"},
+                            "881871844": {"steam_id": "76561198873916688", "faceit_nick": "soft_hyper"},
+                            "919046867": {"steam_id": "76561199069180401", "faceit_nick": "m6ntai"},
+                            "2033412443": {"steam_id": "76561199767276086", "faceit_nick": "Increble"}
+                        }
+                        json.dump(initial_users, f, ensure_ascii=False, indent=2)
+                    else:
+                        json.dump({}, f, ensure_ascii=False, indent=2)
+                logging.info(f"✅ Файл {file} создан успешно")
+            except Exception as e:
+                logging.error(f"❌ Ошибка создания файла {file}: {e}")
+        else:
+            logging.info(f"✅ Файл {file} уже существует")
+
+# Инициализируем файлы при запуске
+init_files()
 
 
 def load_last_post():
     try:
-        if not os.path.exists(LAST_POST_FILE):
+        file_path = get_file_path(LAST_POST_FILE)
+        if not os.path.exists(file_path):
             return None, set()
-            
-        with open(LAST_POST_FILE, "r", encoding="utf-8") as f:
+
+        with open(file_path, "r", encoding="utf-8") as f:
             content = f.read().strip()
             if not content:
                 return None, set()
@@ -72,7 +124,8 @@ def load_last_post():
         return None, set()
     
 def save_last_post(post_time, processed_posts):
-    with open(LAST_POST_FILE, "w", encoding="utf-8") as f:
+    file_path = get_file_path(LAST_POST_FILE)
+    with open(file_path, "w", encoding="utf-8") as f:
         processed_posts_list = list(processed_posts)
         json.dump({
             "last_post_time": post_time,
@@ -423,13 +476,15 @@ async def send_text_fallback(text, url=None, doc_title=None, fallback=False):
 
 def load_users():
     try:
-        with open(USERS_FILE, "r") as f:
+        file_path = get_file_path(USERS_FILE)
+        with open(file_path, "r") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
 
 def save_users(users):
-    with open(USERS_FILE, "w") as f:
+    file_path = get_file_path(USERS_FILE)
+    with open(file_path, "w") as f:
         json.dump(users, f, indent=4)
 
 async def get_faceit_stats(steam_id):
@@ -496,9 +551,10 @@ commands_keyboard = ReplyKeyboardMarkup(
 
 
 def load_events():
-    if os.path.exists(EVENTS_FILE):
+    file_path = get_file_path(EVENTS_FILE)
+    if os.path.exists(file_path):
         try:
-            with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if not content:
                     return {}  # файл есть, но пустой
@@ -509,7 +565,8 @@ def load_events():
     return {}
 
 def save_events():
-    with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+    file_path = get_file_path(EVENTS_FILE)
+    with open(file_path, "w", encoding="utf-8") as f:
         json.dump(cs2_events, f, ensure_ascii=False, indent=2)
 
 
@@ -520,13 +577,15 @@ MEMORY_FILE = "user_memory.json"
 
 
 def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+    file_path = get_file_path(MEMORY_FILE)
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 def save_memory(memory):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+    file_path = get_file_path(MEMORY_FILE)
+    with open(file_path, "w", encoding="utf-8") as f:
         json.dump(memory, f, ensure_ascii=False, indent=2)
 
 
@@ -871,7 +930,11 @@ async def check_event(chat_id, hh, mm):
 
         await asyncio.sleep(30)
 
-
+async def keep_alive():
+    """Периодическая активность чтобы сервис не засыпал"""
+    while True:
+        await asyncio.sleep(300)  # Каждые 5 минут
+        logging.info("🤖 Bot keep-alive - service is active")
 
 async def main():
     # Отправляем сообщение о запуске
@@ -891,6 +954,8 @@ async def main():
 
     # Запускаем мониторинг канала в фоне
     asyncio.create_task(scheduled_channel_check())
+
+    asyncio.create_task(keep_alive())
     
     # Запускаем планировщик
     scheduler = AsyncIOScheduler()

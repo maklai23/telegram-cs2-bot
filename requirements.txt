@@ -5,3 +5,4 @@ aiogram==3.22.0
 apscheduler==3.11.0
 mistralai==1.9.11
 python-dotenv==1.0.0
+soupsieve==2.5
