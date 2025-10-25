@@ -9,6 +9,8 @@ import requests
 import base64
 import signal
 import sys
+import time
+from functools import lru_cache
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -26,6 +28,10 @@ from mistralai import Mistral
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8023437078:AAFT5qCCe05oVgKgqaBZlbzuq1nd4wLizhM")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV")
 BOT_USERNAME = "team_spirt2_bot"
+
+# Кеш для статистики (50 минут)
+faceit_cache = {}
+CACHE_DURATION = 3000
 
 # Константы
 LAST_POST_FILE = "last_telegram_post.json"
@@ -183,6 +189,29 @@ def clean_markdown_text(text):
     text = re.sub(r'`([^`]*)$', r'\1', text)
     text = re.sub(r'_{3,}', '___', text)
     return text
+
+async def get_faceit_stats_cached(steam_id):
+    """Кешированная версия с fallback"""
+    now = time.time()
+    
+    # Проверяем кеш
+    if steam_id in faceit_cache:
+        cached_time, cached_data = faceit_cache[steam_id]
+        if now - cached_time < CACHE_DURATION:
+            return cached_data
+    
+    # Получаем свежие данные
+    stats = await get_faceit_stats(steam_id)
+    
+    # Если не удалось - используем старые кешированные данные (если есть)
+    if not stats and steam_id in faceit_cache:
+        return faceit_cache[steam_id][1]
+    
+    # Сохраняем в кеш
+    if stats:
+        faceit_cache[steam_id] = (now, stats)
+    
+    return stats
 
 # ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
 logging.basicConfig(
@@ -354,95 +383,152 @@ JOKES = [
 
 # ==================== FACEIT API ====================
 async def get_faceit_stats(steam_id):
+    """Обновленная функция для обхода защиты Faceit"""
     try:
-        # Пробуем несколько источников
+        # Основной работающий источник
+        url = f"https://faceitfinder.com/profile/{steam_id}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "pragma": "no-cache",
+            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "upgrade-insecure-requests": "1"
+        }
+
+        # Создаем кастомный коннектор с поддержкой brotli
+        import aiohttp
+        import ssl
+        import certifi
+        
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        
+        timeout = aiohttp.ClientTimeout(total=15)
+        
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        ) as session:
+            
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    
+                    return parse_faceit_data_updated(soup)
+                else:
+                    logging.error(f"FaceitFinder статус: {resp.status}")
+                    return await fallback_faceit_source(steam_id)
+                    
+    except Exception as e:
+        logging.error(f"Ошибка получения статистики Faceit: {e}")
+        return await fallback_faceit_source(steam_id)
+
+async def fallback_faceit_source(steam_id):
+    """Резервные источники если основной не работает"""
+    try:
+        # Пробуем альтернативные источники
         sources = [
-            f"https://faceitstats.com/player/{steam_id}",
             f"https://tracker.gg/faceit/profile/steam/{steam_id}",
-            f"https://faceitfinder.com/profile/{steam_id}"
+            f"https://faceitstats.com/player/{steam_id}",
         ]
         
         for url in sources:
             try:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "DNT": "1",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Cache-Control": "max-age=0"
-                }
-                
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers, timeout=10) as resp:
+                    async with session.get(url, timeout=10) as resp:
                         if resp.status == 200:
                             html = await resp.text()
                             soup = BeautifulSoup(html, "html.parser")
-                            
-                            # Парсим данные в зависимости от сайта
-                            stats = parse_faceit_data(soup, url)
+                            stats = parse_faceit_data_updated(soup, url)
                             if stats:
-                                logging.info(f"✅ Статистика получена с {url}")
+                                logging.info(f"✅ Резервный источник: {url}")
                                 return stats
-            except Exception as e:
-                logging.warning(f"❌ Не удалось получить с {url}: {e}")
+            except:
                 continue
-        
-        logging.error("❌ Все источники недоступны")
+                
         return None
-        
     except Exception as e:
-        logging.error(f"❌ Ошибка получения статистики Faceit: {e}")
+        logging.error(f"Резервные источники недоступны: {e}")
         return None
 
-def parse_faceit_data(soup, url):
-    """Парсит данные с разных сайтов"""
-    stats = {}
-    
-    if "faceitstats.com" in url:
-        # Парсим faceitstats.com
-        nickname = soup.select_one(".player-name")
-        level = soup.select_one(".player-level")
-        elo = soup.select_one(".player-elo")
+def parse_faceit_data_updated(soup, source_url=""):
+    """Обновленный парсер для Faceit"""
+    try:
+        stats = {}
         
-        stats = {
-            "faceit_nick": nickname.text.strip() if nickname else "?",
-            "faceit_level": level.text.strip() if level else "?",
-            "ELO": elo.text.strip() if elo else "?",
-            "source": "faceitstats.com"
-        }
+        # Универсальный парсинг для разных сайтов
+        selectors = [
+            # FaceitFinder
+            (".account-steam-name span", "steam_name"),
+            (".account-faceit-title-username", "faceit_nick"), 
+            (".account-faceit-level img", "faceit_level"),
+            ("li.tick:-soup-contains('CS total hours') span", "cs_hours"),
+            
+            # Tracker.gg
+            (".trn-profile-header__name", "faceit_nick"),
+            (".faceit-level .value", "faceit_level"),
+            
+            # FaceitStats
+            (".player-name", "faceit_nick"),
+            (".player-level", "faceit_level"),
+            (".player-elo", "ELO"),
+        ]
         
-    elif "tracker.gg" in url:
-        # Парсим tracker.gg
-        nickname = soup.select_one(".trn-profile-header__name")
-        stats_elements = soup.select(".numbers .value")
+        for selector, key in selectors:
+            if key not in stats or stats[key] == "?":
+                element = soup.select_one(selector)
+                if element:
+                    if key == "faceit_level" and "img" in selector:
+                        # Извлекаем уровень из alt текста
+                        level_text = element.get("alt", "")
+                        level = next((s for s in level_text.split() if s.isdigit()), "?")
+                        stats[key] = level
+                    else:
+                        stats[key] = element.text.strip()
         
-        stats = {
-            "faceit_nick": nickname.text.strip() if nickname else "?",
-            "faceit_level": stats_elements[0].text.strip() if len(stats_elements) > 0 else "?",
-            "ELO": stats_elements[1].text.strip() if len(stats_elements) > 1 else "?",
-            "source": "tracker.gg"
-        }
+        # Статистика из таблиц
+        stats_elements = soup.select("div.account-faceit-stats-single, .numbers .value, .stat__value")
+        for i, elem in enumerate(stats_elements):
+            text = elem.get_text(strip=True)
+            if ":" in text:
+                key, value = text.split(":", 1)
+                stats[key.strip()] = value.strip()
+            elif i == 0:
+                stats["Matches"] = text
+            elif i == 1:
+                stats["ELO"] = text
+            elif i == 2:
+                stats["K/D"] = text
+            elif i == 3:
+                stats["Winrt"] = text
         
-    elif "faceitfinder.com" in url:
-        # Старый парсер для faceitfinder.com
-        steam_name = soup.select_one(".account-steam-name span")
-        faceit_nick = soup.select_one(".account-faceit-title-username")
-        faceit_level = soup.select_one(".account-faceit-level img")
+        # Заполняем обязательные поля
+        required_fields = ["steam_name", "faceit_nick", "faceit_level", "ELO", "K/D", "Winrt", "Matches", "cs_hours"]
+        for field in required_fields:
+            if field not in stats:
+                stats[field] = "?"
         
-        stats = {
-            "steam_name": steam_name.text.strip() if steam_name else "?",
-            "faceit_nick": faceit_nick.text.strip() if faceit_nick else "?",
-            "faceit_level": next((s for s in faceit_level.get("alt", "").split() if s.isdigit()), "?") if faceit_level else "?",
-            "source": "faceitfinder.com"
-        }
-    
-    return stats if stats.get("faceit_nick") and stats["faceit_nick"] != "?" else None
+        # Нормализация WinRate
+        if stats["Winrt"] != "?" and "%" not in stats["Winrt"]:
+            stats["Winrt"] = f"{stats['Winrt']}%"
+        
+        logging.info(f"✅ Парсинг успешен: {stats['faceit_nick']}")
+        return stats
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка парсинга: {e}")
+        return None
 
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
@@ -778,33 +864,42 @@ async def stats_command(message: Message):
     tg_id = str(message.from_user.id)
     
     if tg_id not in users:
-        await message.reply("Используйте /bind <SteamID64> для привязки")
+        await message.reply("❌ Используй /bind <SteamID64> чтобы привязать Steam")
         return
 
-    stats = await get_faceit_stats(users[tg_id]["steam_id"])
+    loading_msg = await message.reply("🔄 Обновляю статистику...")
+    
+    # Используем кешированную версию
+    stats = await get_faceit_stats_cached(users[tg_id]["steam_id"])
+    
     if not stats:
-        await message.reply("Не удалось получить статистику.")
+        await loading_msg.edit_text(
+            "❌ Не удалось получить актуальную статистику.\n"
+            "💡 Используем последние известные данные..."
+        )
+        # Показываем хотя бы SteamID
+        text = f"🔗 SteamID: `{users[tg_id]['steam_id']}`\n\n"
+        text += "📡 Faceit сервисы временно недоступны"
+        await loading_msg.edit_text(text)
         return
 
-    # Обработка WinRate с разными форматами
+    # Форматируем текст
     winrate = stats.get('Winrt', '?')
-    if winrate != '?':
-        # Убираем возможные лишние символы процента
-        winrate = winrate.replace('%', '').strip()
-        if winrate.replace('.', '').isdigit():
-            winrate = f"{winrate}%"
+    if winrate != '?' and not winrate.endswith('%'):
+        winrate = f"{winrate}%"
 
     text = (
-        f"Steam: {stats['steam_name']}\n"
-        f"CS hours: {stats['cs_hours']}\n"
-        f"Faceit: {stats['faceit_nick']}\n"
-        f"Level: {stats['faceit_level']}\n"
-        f"Matches: {stats.get('Matches','?')}\n"
-        f"ELO: {stats.get('ELO','?')}\n"
-        f"K/D: {stats.get('K/D','?')}\n"
-        f"Winrate: {winrate}"
+        f"👤 **Игрок:** {stats['faceit_nick']}\n"
+        f"🎯 **Уровень:** {stats['faceit_level']}\n"
+        f"🏆 **ELO:** {stats.get('ELO', '?')}\n"
+        f"📊 **Матчи:** {stats.get('Matches', '?')}\n"
+        f"🎯 **K/D:** {stats.get('K/D', '?')}\n"
+        f"📈 **WinRate:** {winrate}\n"
+        f"⏰ **Часы CS:** {stats.get('cs_hours', '?')}\n"
+        f"🔗 **SteamID:** `{users[tg_id]['steam_id']}`"
     )
-    await message.reply(text)
+    
+    await loading_msg.edit_text(text)
 
 @dp.message(Command("bind"))
 async def bind_steam(message: Message):
@@ -827,6 +922,27 @@ async def bind_steam(message: Message):
     
     save_users(users)
     await message.reply(f"✅ Привязан SteamID: {steam_id}")
+
+@dp.message(Command("refresh_stats"))
+async def refresh_stats_command(message: Message):
+    """Принудительное обновление статистики"""
+    if not is_allowed_topic(message):
+        return
+        
+    users = load_users()
+    tg_id = str(message.from_user.id)
+    
+    if tg_id not in users:
+        await message.reply("❌ Сначала привяжи Steam через /bind")
+        return
+
+    # Очищаем кеш для этого пользователя
+    steam_id = users[tg_id]["steam_id"]
+    if steam_id in faceit_cache:
+        del faceit_cache[steam_id]
+    
+    await message.reply("🔄 Принудительно обновляю статистику...")
+    await stats_command(message)
 
 @dp.message(Command("list_all_stats"))
 async def list_all_stats(message: types.Message):
