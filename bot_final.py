@@ -383,16 +383,20 @@ JOKES = [
 
 # ==================== FACEIT API ====================
 async def get_faceit_stats(steam_id):
-    """Обновленная функция для обхода защиты Faceit"""
+    """Улучшенная функция с обходом блокировок"""
     try:
-        # Основной работающий источник
-        url = f"https://faceitfinder.com/profile/{steam_id}"
+        # Основной работающий источник - используем Steam API как fallback
+        sources = [
+            f"https://faceitstats.com/player/{steam_id}",
+            f"https://tracker.gg/faceit/profile/steam/{steam_id}",
+            f"https://faceitfinder.com/profile/{steam_id}",
+        ]
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate",
             "Cache-Control": "no-cache",
             "pragma": "no-cache",
             "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
@@ -404,114 +408,119 @@ async def get_faceit_stats(steam_id):
             "upgrade-insecure-requests": "1"
         }
 
-        # Создаем кастомный коннектор с поддержкой brotli
-        import aiohttp
-        import ssl
-        import certifi
-        
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
-        
-        timeout = aiohttp.ClientTimeout(total=15)
-        
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            headers=headers
-        ) as session:
-            
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    
-                    return parse_faceit_data_updated(soup)
-                else:
-                    logging.error(f"FaceitFinder статус: {resp.status}")
-                    return await fallback_faceit_source(steam_id)
-                    
-    except Exception as e:
-        logging.error(f"Ошибка получения статистики Faceit: {e}")
-        return await fallback_faceit_source(steam_id)
-
-async def fallback_faceit_source(steam_id):
-    """Резервные источники если основной не работает"""
-    try:
-        # Пробуем альтернативные источники
-        sources = [
-            f"https://tracker.gg/faceit/profile/steam/{steam_id}",
-            f"https://faceitstats.com/player/{steam_id}",
-        ]
-        
         for url in sources:
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=10) as resp:
+                # Используем простой коннектор без SSL проверки
+                connector = aiohttp.TCPConnector(ssl=False)
+                timeout = aiohttp.ClientTimeout(total=10)
+                
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                    headers=headers
+                ) as session:
+                    
+                    async with session.get(url, ssl=False) as resp:
                         if resp.status == 200:
                             html = await resp.text()
                             soup = BeautifulSoup(html, "html.parser")
-                            stats = parse_faceit_data_updated(soup, url)
-                            if stats:
-                                logging.info(f"✅ Резервный источник: {url}")
+                            stats = parse_faceit_simple(soup, url)
+                            if stats and stats.get('faceit_nick') != "?":
+                                logging.info(f"✅ Статистика получена с {url}")
                                 return stats
-            except:
+                        else:
+                            logging.warning(f"❌ {url} вернул статус: {resp.status}")
+            except Exception as e:
+                logging.warning(f"❌ Не удалось получить с {url}: {str(e)[:100]}")
                 continue
-                
-        return None
+        
+        # Если все источники не работают - возвращаем базовую информацию
+        return await get_fallback_stats(steam_id)
+        
     except Exception as e:
-        logging.error(f"Резервные источники недоступны: {e}")
-        return None
+        logging.error(f"❌ Ошибка получения статистики Faceit: {e}")
+        return await get_fallback_stats(steam_id)
 
-def parse_faceit_data_updated(soup, source_url=""):
-    """Обновленный парсер для Faceit"""
+async def get_fallback_stats(steam_id):
+    """Возвращает базовую информацию когда Faceit недоступен"""
+    try:
+        # Пробуем получить хотя бы ник из Steam
+        steam_url = f"https://steamcommunity.com/profiles/{steam_id}?xml=1"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(steam_url, timeout=5) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    # Простой парсинг Steam профиля
+                    nick_match = re.search(r'<steamID><!\[CDATA\[(.*?)\]\]></steamID>', text)
+                    steam_name = nick_match.group(1) if nick_match else f"Игрок {steam_id[-4:]}"
+                    
+                    return {
+                        "steam_name": steam_name,
+                        "faceit_nick": steam_name,
+                        "faceit_level": "?",
+                        "ELO": "?",
+                        "Matches": "?",
+                        "K/D": "?",
+                        "Winrt": "?",
+                        "cs_hours": "?",
+                        "source": "Steam Fallback"
+                    }
+    except:
+        pass
+    
+    # Минимальная fallback статистика
+    return {
+        "steam_name": f"Игрок {steam_id[-4:]}",
+        "faceit_nick": f"Игрок {steam_id[-4:]}",
+        "faceit_level": "?",
+        "ELO": "?",
+        "Matches": "?",
+        "K/D": "?",
+        "Winrt": "?",
+        "cs_hours": "?",
+        "source": "Fallback"
+    }
+
+def parse_faceit_simple(soup, url):
+    """Упрощенный парсер для Faceit"""
     try:
         stats = {}
         
-        # Универсальный парсинг для разных сайтов
-        selectors = [
-            # FaceitFinder
-            (".account-steam-name span", "steam_name"),
-            (".account-faceit-title-username", "faceit_nick"), 
-            (".account-faceit-level img", "faceit_level"),
-            ("li.tick:-soup-contains('CS total hours') span", "cs_hours"),
+        # Базовые селекторы для разных сайтов
+        if "faceitstats.com" in url:
+            nickname = soup.select_one(".player-name")
+            level = soup.select_one(".player-level")
+            elo = soup.select_one(".player-elo")
             
-            # Tracker.gg
-            (".trn-profile-header__name", "faceit_nick"),
-            (".faceit-level .value", "faceit_level"),
+            stats = {
+                "faceit_nick": nickname.text.strip() if nickname else "?",
+                "faceit_level": level.text.strip() if level else "?",
+                "ELO": elo.text.strip() if elo else "?",
+                "source": "faceitstats.com"
+            }
             
-            # FaceitStats
-            (".player-name", "faceit_nick"),
-            (".player-level", "faceit_level"),
-            (".player-elo", "ELO"),
-        ]
-        
-        for selector, key in selectors:
-            if key not in stats or stats[key] == "?":
-                element = soup.select_one(selector)
-                if element:
-                    if key == "faceit_level" and "img" in selector:
-                        # Извлекаем уровень из alt текста
-                        level_text = element.get("alt", "")
-                        level = next((s for s in level_text.split() if s.isdigit()), "?")
-                        stats[key] = level
-                    else:
-                        stats[key] = element.text.strip()
-        
-        # Статистика из таблиц
-        stats_elements = soup.select("div.account-faceit-stats-single, .numbers .value, .stat__value")
-        for i, elem in enumerate(stats_elements):
-            text = elem.get_text(strip=True)
-            if ":" in text:
-                key, value = text.split(":", 1)
-                stats[key.strip()] = value.strip()
-            elif i == 0:
-                stats["Matches"] = text
-            elif i == 1:
-                stats["ELO"] = text
-            elif i == 2:
-                stats["K/D"] = text
-            elif i == 3:
-                stats["Winrt"] = text
+        elif "tracker.gg" in url:
+            nickname = soup.select_one(".trn-profile-header__name")
+            level_elem = soup.select_one(".faceit-level .value")
+            
+            stats = {
+                "faceit_nick": nickname.text.strip() if nickname else "?",
+                "faceit_level": level_elem.text.strip() if level_elem else "?",
+                "ELO": "?",  # tracker.gg не показывает ELO напрямую
+                "source": "tracker.gg"
+            }
+            
+        elif "faceitfinder.com" in url:
+            steam_name = soup.select_one(".account-steam-name span")
+            faceit_nick = soup.select_one(".account-faceit-title-username")
+            faceit_level = soup.select_one(".account-faceit-level img")
+            
+            stats = {
+                "steam_name": steam_name.text.strip() if steam_name else "?",
+                "faceit_nick": faceit_nick.text.strip() if faceit_nick else "?",
+                "faceit_level": next((s for s in faceit_level.get("alt", "").split() if s.isdigit()), "?") if faceit_level else "?",
+                "source": "faceitfinder.com"
+            }
         
         # Заполняем обязательные поля
         required_fields = ["steam_name", "faceit_nick", "faceit_level", "ELO", "K/D", "Winrt", "Matches", "cs_hours"]
@@ -519,17 +528,15 @@ def parse_faceit_data_updated(soup, source_url=""):
             if field not in stats:
                 stats[field] = "?"
         
-        # Нормализация WinRate
-        if stats["Winrt"] != "?" and "%" not in stats["Winrt"]:
-            stats["Winrt"] = f"{stats['Winrt']}%"
+        # Если не удалось получить ник, используем fallback
+        if stats["faceit_nick"] == "?":
+            stats["faceit_nick"] = stats.get("steam_name", "Игрок")
         
-        logging.info(f"✅ Парсинг успешен: {stats['faceit_nick']}")
         return stats
         
     except Exception as e:
         logging.error(f"❌ Ошибка парсинга: {e}")
         return None
-
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
     text_hash = hash(post['text'][:100] if post['text'] else "media") % 10000
@@ -867,37 +874,41 @@ async def stats_command(message: Message):
         await message.reply("❌ Используй /bind <SteamID64> чтобы привязать Steam")
         return
 
-    loading_msg = await message.reply("🔄 Обновляю статистику...")
+    loading_msg = await message.reply("🔄 Получаю статистику...")
     
     # Используем кешированную версию
     stats = await get_faceit_stats_cached(users[tg_id]["steam_id"])
     
     if not stats:
-        await loading_msg.edit_text(
-            "❌ Не удалось получить актуальную статистику.\n"
-            "💡 Используем последние известные данные..."
-        )
-        # Показываем хотя бы SteamID
-        text = f"🔗 SteamID: `{users[tg_id]['steam_id']}`\n\n"
-        text += "📡 Faceit сервисы временно недоступны"
-        await loading_msg.edit_text(text)
+        await loading_msg.edit_text("❌ Не удалось получить статистику.")
         return
 
-    # Форматируем текст
+    # Форматируем текст с учетом возможных отсутствующих данных
     winrate = stats.get('Winrt', '?')
     if winrate != '?' and not winrate.endswith('%'):
         winrate = f"{winrate}%"
 
-    text = (
-        f"👤 **Игрок:** {stats['faceit_nick']}\n"
-        f"🎯 **Уровень:** {stats['faceit_level']}\n"
-        f"🏆 **ELO:** {stats.get('ELO', '?')}\n"
-        f"📊 **Матчи:** {stats.get('Matches', '?')}\n"
-        f"🎯 **K/D:** {stats.get('K/D', '?')}\n"
-        f"📈 **WinRate:** {winrate}\n"
-        f"⏰ **Часы CS:** {stats.get('cs_hours', '?')}\n"
-        f"🔗 **SteamID:** `{users[tg_id]['steam_id']}`"
-    )
+    # Создаем информативное сообщение
+    lines = [
+        f"👤 **Игрок:** {stats['faceit_nick']}",
+        f"🎯 **Уровень:** {stats['faceit_level']}",
+        f"🏆 **ELO:** {stats.get('ELO', '?')}",
+    ]
+    
+    # Добавляем дополнительную статистику если есть
+    if stats.get('Matches') != '?':
+        lines.append(f"📊 **Матчи:** {stats['Matches']}")
+    if stats.get('K/D') != '?':
+        lines.append(f"🎯 **K/D:** {stats['K/D']}")
+    if winrate != '?':
+        lines.append(f"📈 **WinRate:** {winrate}")
+    if stats.get('cs_hours') != '?':
+        lines.append(f"⏰ **Часы CS:** {stats['cs_hours']}")
+    
+    lines.append(f"🔗 **SteamID:** `{users[tg_id]['steam_id']}`")
+    lines.append(f"📡 **Источник:** {stats.get('source', 'Faceit')}")
+    
+    text = "\n".join(lines)
     
     await loading_msg.edit_text(text)
 
