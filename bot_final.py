@@ -7,6 +7,8 @@ import aiohttp
 import re
 import requests
 import base64
+import signal
+import sys
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -353,69 +355,94 @@ JOKES = [
 # ==================== FACEIT API ====================
 async def get_faceit_stats(steam_id):
     try:
-        url = f"https://faceitfinder.com/profile/{steam_id}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logging.error(f"FaceitFinder вернул статус: {resp.status}")
-                    return None
-                html = await resp.text()
-                soup = BeautifulSoup(html, "html.parser")
-
-                # Более надежное извлечение основных данных
-                steam_name = soup.select_one(".account-steam-name span")
-                cs_hours = soup.select_one("li.tick:-soup-contains('CS total hours') span")
-                faceit_nick = soup.select_one(".account-faceit-title-username")
-                faceit_level = soup.select_one(".account-faceit-level img")
-
-                # Улучшенное извлечение статистики
-                stats = {}
-                
-                # Способ 1: Поиск по классам статистики
-                stats_tags = soup.select("div.account-faceit-stats-single")
-                for tag in stats_tags:
-                    text = tag.get_text(strip=True)
-                    if ":" in text:
-                        key, value = text.split(":", 1)
-                        stats[key.strip()] = value.strip()
-                
-                # Способ 2: Поиск по конкретным меткам
-                stat_labels = ["Matches", "Wins", "Losses", "Win Rate", "Win %", "K/D", "K/D Ratio", "ELO"]
-                for label in stat_labels:
-                    element = soup.find(string=re.compile(f"{label}", re.IGNORECASE))
-                    if element:
-                        parent = element.find_parent()
-                        if parent:
-                            value = parent.get_text().split(":")[-1].strip()
-                            stats[label] = value
-
-                # Нормализация ключей статистики
-                normalized_stats = {}
-                key_mapping = {
-                    "Win Rate": "Winrt",
-                    "Win %": "Winrt", 
-                    "Winrate": "Winrt",
-                    "K/D Ratio": "K/D",
-                    "K/D ": "K/D"
+        # Пробуем несколько источников
+        sources = [
+            f"https://faceitstats.com/player/{steam_id}",
+            f"https://tracker.gg/faceit/profile/steam/{steam_id}",
+            f"https://faceitfinder.com/profile/{steam_id}"
+        ]
+        
+        for url in sources:
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Cache-Control": "max-age=0"
                 }
                 
-                for key, value in stats.items():
-                    normalized_key = key_mapping.get(key, key)
-                    normalized_stats[normalized_key] = value
-
-                # Логируем для отладки
-                logging.info(f"Извлеченная статистика для {steam_id}: {normalized_stats}")
-
-                return {
-                    "steam_name": steam_name.text.strip() if steam_name else "?",
-                    "cs_hours": cs_hours.text.strip() if cs_hours else "?",
-                    "faceit_nick": faceit_nick.text.strip() if faceit_nick else "?",
-                    "faceit_level": next((s for s in faceit_level.get("alt", "").split() if s.isdigit()), "?") if faceit_level else "?",
-                    **normalized_stats
-                }
-    except Exception as e:
-        logging.error(f"Ошибка получения статистики Faceit: {e}")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, timeout=10) as resp:
+                        if resp.status == 200:
+                            html = await resp.text()
+                            soup = BeautifulSoup(html, "html.parser")
+                            
+                            # Парсим данные в зависимости от сайта
+                            stats = parse_faceit_data(soup, url)
+                            if stats:
+                                logging.info(f"✅ Статистика получена с {url}")
+                                return stats
+            except Exception as e:
+                logging.warning(f"❌ Не удалось получить с {url}: {e}")
+                continue
+        
+        logging.error("❌ Все источники недоступны")
         return None
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения статистики Faceit: {e}")
+        return None
+
+def parse_faceit_data(soup, url):
+    """Парсит данные с разных сайтов"""
+    stats = {}
+    
+    if "faceitstats.com" in url:
+        # Парсим faceitstats.com
+        nickname = soup.select_one(".player-name")
+        level = soup.select_one(".player-level")
+        elo = soup.select_one(".player-elo")
+        
+        stats = {
+            "faceit_nick": nickname.text.strip() if nickname else "?",
+            "faceit_level": level.text.strip() if level else "?",
+            "ELO": elo.text.strip() if elo else "?",
+            "source": "faceitstats.com"
+        }
+        
+    elif "tracker.gg" in url:
+        # Парсим tracker.gg
+        nickname = soup.select_one(".trn-profile-header__name")
+        stats_elements = soup.select(".numbers .value")
+        
+        stats = {
+            "faceit_nick": nickname.text.strip() if nickname else "?",
+            "faceit_level": stats_elements[0].text.strip() if len(stats_elements) > 0 else "?",
+            "ELO": stats_elements[1].text.strip() if len(stats_elements) > 1 else "?",
+            "source": "tracker.gg"
+        }
+        
+    elif "faceitfinder.com" in url:
+        # Старый парсер для faceitfinder.com
+        steam_name = soup.select_one(".account-steam-name span")
+        faceit_nick = soup.select_one(".account-faceit-title-username")
+        faceit_level = soup.select_one(".account-faceit-level img")
+        
+        stats = {
+            "steam_name": steam_name.text.strip() if steam_name else "?",
+            "faceit_nick": faceit_nick.text.strip() if faceit_nick else "?",
+            "faceit_level": next((s for s in faceit_level.get("alt", "").split() if s.isdigit()), "?") if faceit_level else "?",
+            "source": "faceitfinder.com"
+        }
+    
+    return stats if stats.get("faceit_nick") and stats["faceit_nick"] != "?" else None
 
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
@@ -985,26 +1012,24 @@ async def handle_message(message: Message):
         logging.error(f"Ошибка Mistral: {e}")
         await message.reply("❌ Ошибка генерации ответа.")
 
+
+def handle_sigterm(*args):
+    """Обработчик сигнала завершения"""
+    print("🔄 Received SIGTERM, shutting down gracefully...")
+    # Не отправляем сообщение в Telegram - это может вызвать рестарт
+    sys.exit(0)
+
+# Регистрируем обработчик сигналов
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
+
+
+
+
 # ==================== ЗАПУСК ====================
 async def main():
-    # Импортируем keep_alive
-    from keep_alive import keep_alive
     
-    # Запускаем веб-сервер для UptimeRobot
-    keep_alive()
     
-    # Восстанавливаем данные из GitHub при запуске
-    if GITHUB_TOKEN and GITHUB_REPO:
-        await asyncio.get_event_loop().run_in_executor(None, restore_from_github)
-    
-    # Создаем файлы если нет (остальной код без изменений)
-    for file, default in [(USERS_FILE, {}), (LAST_POST_FILE, {"last_post_time": None, "processed_posts": []}), 
-                         (EVENTS_FILE, {}), (MEMORY_FILE, {})]:
-        if not os.path.exists(file):
-            with open(file, "w", encoding="utf-8") as f:
-                json.dump(default, f, indent=2, ensure_ascii=False)
-
-
     # Создаем файлы если нет
     for file, default in [(USERS_FILE, {}), (LAST_POST_FILE, {"last_post_time": None, "processed_posts": []}), 
                          (EVENTS_FILE, {}), (MEMORY_FILE, {})]:
@@ -1012,57 +1037,24 @@ async def main():
             with open(file, "w", encoding="utf-8") as f:
                 json.dump(default, f, indent=2, ensure_ascii=False)
 
-    # Отправляем сообщение о запуске
-    try:
-        await bot.send_message(
-            chat_id=CHAT_ID, 
-            text="🚀 **Бот запущен локально!**\n\n"
-                 "✅ Мониторинг канала активирован\n"
-                 "✅ Система событий работает\n"
-                 "✅ Faceit статистика доступна\n"
-                 "✅ AI-помощник готов к работе\n"
-                 "✅ Локальные файлы памяти активны",
-            parse_mode="Markdown"
-        )
-        logging.info("✅ Сообщение о запуске отправлено в чат")
-    except Exception as e:
-        logging.error(f"❌ Не удалось отправить сообщение о запуске: {e}")
+    # Восстанавливаем данные из GitHub при запуске
+    if GITHUB_TOKEN and GITHUB_REPO:
+        await asyncio.get_event_loop().run_in_executor(None, restore_from_github)
 
     # Запускаем мониторинг канала в фоне
     asyncio.create_task(scheduled_channel_check())
     
-    print("🟢 Бот запущен и работает локально...")
+    print("🟢 Бот запущен на Railway...")
 
+    # Очищаем обновления и запускаем polling
     await bot(DeleteWebhook(drop_pending_updates=True))
     
     try:
-        # Старт бота
+        # Старт бота - ОСНОВНОЙ ЦИКЛ
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except Exception as e:
         logging.error(f"❌ Ошибка при работе бота: {e}")
-        # Отправляем сообщение об ошибке
-        try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"❌ **Бот аварийно остановлен!**\n\nПричина: `{str(e)[:200]}`",
-                parse_mode="Markdown"
-            )
-        except:
-            pass
         raise
-    finally:
-        # Отправляем сообщение об остановке
-        try:
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text="🛑 **Бот остановлен**\n\nВсе функции отключены",
-                parse_mode="Markdown"
-            )
-            logging.info("✅ Сообщение об остановке отправлено в чат")
-        except Exception as e:
-            logging.error(f"❌ Не удалось отправить сообщение об остановке: {e}")
-        
-        print("🔴 Бот остановлен.")
 
 if __name__ == "__main__":
     asyncio.run(main())
