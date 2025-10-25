@@ -1027,8 +1027,28 @@ signal.signal(signal.SIGINT, handle_sigterm)
 
 
 # ==================== ЗАПУСК ====================
+async def hard_reset_webhook():
+
+    """Жесткий сброс через прямые HTTP запросы"""
+    try:
+        # Метод 1: Через requests
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        params = {"drop_pending_updates": True}
+        
+        response = requests.get(url, params=params, timeout=10)
+        print(f"✅ Webhook reset response: {response.status_code}")
+        
+        # Метод 2: Дополнительная очистка
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+        requests.get(url, timeout=5)
+        
+        await asyncio.sleep(3)
+        
+    except Exception as e:
+        print(f"❌ Hard reset failed: {e}")
+
 async def main():
-    
+    await hard_reset_webhook()
     
     # Создаем файлы если нет
     for file, default in [(USERS_FILE, {}), (LAST_POST_FILE, {"last_post_time": None, "processed_posts": []}), 
