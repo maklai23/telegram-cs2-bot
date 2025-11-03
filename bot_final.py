@@ -129,10 +129,10 @@ def restore_from_github():
 # ==================== КОНФИГУРАЦИЯ ТЕМ ====================
 # Инициализация ID тем (None = не настроено). Используйте /setup_topics чтобы задать.
 TOPIC_IDS = {
-    "HUMAN_CHAT": None,
-    "BOT_CHAT": None,
-    "NEWS_CHAT": None,
-    "NEWS_RETAKE_CHAT": None,
+    "HUMAN_CHAT": 8,
+    "BOT_CHAT": 3,
+    "NEWS_CHAT": 6,
+    "NEWS_RETAKE_CHAT": 1408,
 }
 
 # ==================== УТИЛИТЫ ====================
@@ -391,16 +391,16 @@ async def get_faceit_stats(steam_id):
     try:
         # Основной работающий источник - используем Steam API как fallback
         sources = [
-            f"https://faceitstats.com/player/{steam_id}",
-            f"https://tracker.gg/faceit/profile/steam/{steam_id}",
             f"https://faceitfinder.com/profile/{steam_id}",
+                f"https://faceitstats.com/player/{steam_id}",
+                f"https://tracker.gg/faceit/profile/steam/{steam_id}"
         ]
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
+                "Accept-Encoding": "gzip, deflate, br",
             "Cache-Control": "no-cache",
             "pragma": "no-cache",
             "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
@@ -409,7 +409,8 @@ async def get_faceit_stats(steam_id):
             "sec-fetch-dest": "document",
             "sec-fetch-mode": "navigate",
             "sec-fetch-site": "none",
-            "upgrade-insecure-requests": "1"
+                "upgrade-insecure-requests": "1",
+                "Referer": "https://www.google.com/"
         }
 
         for url in sources:
@@ -479,60 +480,127 @@ async def get_fallback_stats(steam_id):
     }
 
 def parse_faceit_simple(soup, url):
-    """Упрощенный парсер для Faceit"""
+    """Упрощенный парсер для Faceit.
+    Пытается сначала взять данные по целевым селекторам, затем применяет regex-фоллбэк по тексту.
+    Возвращает словарь с полями, отсутствующие заполняются "*".
+    """
     try:
-        stats = {}
-        
-        # Базовые селекторы для разных сайтов
+        stats = {
+            "steam_name": "*",
+            "faceit_nick": "*",
+            "faceit_level": "*",
+            "ELO": "*",
+            "Matches": "*",
+            "K/D": "*",
+            "Winrt": "*",
+            "cs_hours": "*",
+            "source": url
+        }
+
+        text = soup.get_text(separator=" ", strip=True)
+
+        # site-specific selectors
         if "faceitstats.com" in url:
             nickname = soup.select_one(".player-name")
             level = soup.select_one(".player-level")
             elo = soup.select_one(".player-elo")
-            
-            stats = {
-                "faceit_nick": nickname.text.strip() if nickname else "?",
-                "faceit_level": level.text.strip() if level else "?",
-                "ELO": elo.text.strip() if elo else "?",
-                "source": "faceitstats.com"
-            }
-            
+
+            if nickname:
+                stats["faceit_nick"] = nickname.text.strip()
+            if level:
+                stats["faceit_level"] = level.text.strip()
+            if elo:
+                stats["ELO"] = elo.text.strip()
+
         elif "tracker.gg" in url:
             nickname = soup.select_one(".trn-profile-header__name")
             level_elem = soup.select_one(".faceit-level .value")
-            
-            stats = {
-                "faceit_nick": nickname.text.strip() if nickname else "?",
-                "faceit_level": level_elem.text.strip() if level_elem else "?",
-                "ELO": "?",  # tracker.gg не показывает ELO напрямую
-                "source": "tracker.gg"
-            }
-            
-        elif "faceitfinder.com" in url:
-            steam_name = soup.select_one(".account-steam-name span")
-            faceit_nick = soup.select_one(".account-faceit-title-username")
-            faceit_level = soup.select_one(".account-faceit-level img")
-            
-            stats = {
-                "steam_name": steam_name.text.strip() if steam_name else "?",
-                "faceit_nick": faceit_nick.text.strip() if faceit_nick else "?",
-                "faceit_level": next((s for s in faceit_level.get("alt", "").split() if s.isdigit()), "?") if faceit_level else "?",
-                "source": "faceitfinder.com"
-            }
-        
-        # Заполняем обязательные поля
-        required_fields = ["steam_name", "faceit_nick", "faceit_level", "ELO", "K/D", "Winrt", "Matches", "cs_hours"]
-        for field in required_fields:
-            if field not in stats:
-                stats[field] = "?"
-        
-        # Если не удалось получить ник, используем fallback
-        if stats["faceit_nick"] == "?":
-            stats["faceit_nick"] = stats.get("steam_name", "Игрок")
-        
+
+            if nickname:
+                stats["faceit_nick"] = nickname.text.strip()
+            if level_elem:
+                stats["faceit_level"] = level_elem.text.strip()
+
+        # Faceitfinder: есть блоки .account-faceit-stats с div.account-faceit-stats-single
+        if "faceitfinder" in url:
+            steam_name = soup.select_one(".account-steam-name span") or soup.select_one(".account-steam-name")
+            faceit_nick = soup.select_one(".account-faceit-title-username") or soup.select_one(".account-faceit-title")
+            faceit_level_img = soup.select_one(".account-faceit-level img") or soup.select_one(".faceit-level img")
+
+            if steam_name:
+                stats["steam_name"] = steam_name.text.strip()
+            if faceit_nick:
+                stats["faceit_nick"] = faceit_nick.text.strip()
+            if faceit_level_img:
+                alt = faceit_level_img.get("alt", "")
+                m = re.search(r"(\d+)", alt)
+                if m:
+                    stats["faceit_level"] = m.group(1)
+
+            # собираем все блоки статистики (видимые и скрытые)
+            blocks = soup.select('.account-faceit-stats')
+            for block in blocks:
+                items = block.select('.account-faceit-stats-single')
+                for item in items:
+                    strong = item.select_one('strong')
+                    value = strong.text.strip() if strong else item.get_text(strip=True)
+                    label_text = item.get_text(separator=' ', strip=True)
+                    # убираем значение из текста метки
+                    label = label_text.replace(value, '').replace(':', '').strip().lower()
+                    if 'matches' in label:
+                        stats['Matches'] = value
+                    elif 'elo' in label:
+                        stats['ELO'] = value
+                    elif 'k/d' in label or 'k/d' in label_text.lower():
+                        stats['K/D'] = value
+                    elif 'winrt' in label or 'win' in label:
+                        stats['Winrt'] = value
+
+            # CS total hours ищется в блоках account-steaminfo-row
+            steaminfo_rows = soup.select('.account-steaminfo-row')
+            for row in steaminfo_rows:
+                txt = row.get_text(separator=' ', strip=True).lower()
+                if 'cs total hours' in txt or 'cs total hours' in row.text:
+                    val = row.select_one('.account-steaminfo-row-value')
+                    if val:
+                        stats['cs_hours'] = val.text.strip()
+                        break
+
+        # Общий regex-фоллбэк по тексту страницы (если какое-то поле осталось '*')
+        if stats['ELO'] == '*':
+            m = re.search(r"ELO[:\s]*([0-9]{2,4})", text, re.IGNORECASE)
+            if m:
+                stats['ELO'] = m.group(1)
+
+        if stats['Matches'] == '*':
+            m = re.search(r"Matches[:\s]*([0-9]{1,5})", text, re.IGNORECASE)
+            if m:
+                stats['Matches'] = m.group(1)
+
+        if stats['Winrt'] == '*':
+            m = re.search(r"Win(?: |-)rt[:\s]*([0-9]{1,3}%?)", text, re.IGNORECASE)
+            if m:
+                stats['Winrt'] = m.group(1)
+
+        if stats['K/D'] == '*':
+            m = re.search(r"K\/?D[:\s]*([0-9]+\.?[0-9]*)", text, re.IGNORECASE)
+            if m:
+                stats['K/D'] = m.group(1)
+
+        if stats['cs_hours'] == '*':
+            m = re.search(r"CS total hours[:\s]*([0-9]+\.?[0-9]*)", text, re.IGNORECASE)
+            if m:
+                stats['cs_hours'] = m.group(1)
+
+        # если ника нет - попробуем steam_name
+        if stats['faceit_nick'] == '*' and stats.get('steam_name') and stats['steam_name'] != '*':
+            stats['faceit_nick'] = stats['steam_name']
+
+        logging.info(f"✅ Статистика получена (источник: {stats.get('source')}) faceit_nick={stats.get('faceit_nick')} level={stats.get('faceit_level')} ELO={stats.get('ELO')}")
         return stats
-        
+
     except Exception as e:
-        logging.error(f"❌ Ошибка парсинга: {e}")
+        logging.exception(f"❌ Ошибка парсинга: {e}")
         return None
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
@@ -642,10 +710,12 @@ async def send_telegram_post(post, source_channel: str = None):
 
         target_chat_id = TARGET_CHAT_ID
         # Роутинг по каналу: для retakenews используем отдельную тему
-        if source_channel and source_channel.lower().startswith("retake"):
-            message_thread_id = TOPIC_IDS.get("NEWS_RETAKE_CHAT")
-        else:
-            message_thread_id = TOPIC_IDS.get("NEWS_CHAT")
+            if source_channel and source_channel.lower() == "retakenews":
+                message_thread_id = TOPIC_IDS.get("NEWS_RETAKE_CHAT")
+                logging.info(f"🔄 Отправка в тему ретейк {message_thread_id}")
+            else:
+                message_thread_id = TOPIC_IDS.get("NEWS_CHAT")
+                logging.info(f"🔄 Отправка в общую тему {message_thread_id}")
 
         thread_kwargs = {"message_thread_id": message_thread_id} if message_thread_id is not None else {}
 
