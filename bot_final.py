@@ -628,8 +628,6 @@ def parse_faceit_simple(soup, url):
                 result = item.get_text(strip=True)
                 recent_results.append(result)
             stats['recent_results'] = ' '.join(recent_results) if recent_results else '*'
-                elif 'entry success rate' in text:
-                    stats['entry_success'] = value_text
 
             # собираем все блоки статистики (видимые и скрытые)
             blocks = soup.select('.account-faceit-stats')
