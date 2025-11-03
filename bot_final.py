@@ -228,29 +228,38 @@ dp = Dispatcher()
 
 # ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ ====================
 def load_last_post():
+    """Загрузка состояния обработанных постов по каналам (новый формат)
+    Возвращает dict: {"channels": {channel: {"last_post_time": ..., "processed_posts": [...]}}}
+    """
     try:
         if not os.path.exists(LAST_POST_FILE):
-            return None, set()
+            return {
+                "channels": {
+                    channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+                }
+            }
         with open(LAST_POST_FILE, "r", encoding="utf-8") as f:
             content = f.read().strip()
             if not content:
-                return None, set()
+                return {
+                    "channels": {
+                        channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+                    }
+                }
             data = json.loads(content)
-            return data.get("last_post_time"), set(data.get("processed_posts", []))
+            # Конвертация старого формата
+            if not isinstance(data, dict) or "channels" not in data:
+                old_time = data.get("last_post_time")
+                old_posts = data.get("processed_posts", [])
+                data = {"channels": {channel: {"last_post_time": old_time, "processed_posts": old_posts} for channel in TELEGRAM_CHANNELS}}
+            return data
     except Exception as e:
         logging.error(f"Ошибка загрузки last_post: {e}")
-        return None, set()
-
-def save_last_post(post_time, processed_posts):
-    try:
-        with open(LAST_POST_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "last_post_time": post_time,
-                "processed_posts": list(processed_posts)
-            }, f, ensure_ascii=False, indent=2)
-        asyncio.create_task(async_backup_to_github())
-    except Exception as e:
-        logging.error(f"Ошибка сохранения last_post: {e}")
+        return {
+            "channels": {
+                channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+            }
+        }
 
 def load_users():
     """Загрузка состояния обработанных постов по каналам"""
@@ -296,10 +305,14 @@ def save_last_post(channel: str, post_time, processed_posts):
             "last_post_time": post_time,
             "processed_posts": list(processed_posts)
         }
-        logging.error(f"Ошибка сохранения users: {e}")
-            json.dump(data, f, indent=2)
-def load_events():
+        with open(LAST_POST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
+    except Exception as e:
         logging.error(f"❌ Ошибка сохранения last_post для канала {channel}: {e}")
+
+def load_events():
+    try:
         if not os.path.exists(EVENTS_FILE):
             return {}
         with open(EVENTS_FILE, "r", encoding="utf-8") as f:
