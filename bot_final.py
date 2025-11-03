@@ -640,7 +640,7 @@ async def send_telegram_post(post, source_channel: str = None):
             escaped_url = escape_markdown_v2(post['url'])
             caption += f"\n\n[Ссылка на пост]({escaped_url})"
 
-    target_chat_id = TARGET_CHAT_ID
+        target_chat_id = TARGET_CHAT_ID
         # Роутинг по каналу: для retakenews используем отдельную тему
         if source_channel and source_channel.lower().startswith("retake"):
             message_thread_id = TOPIC_IDS.get("NEWS_RETAKE_CHAT")
