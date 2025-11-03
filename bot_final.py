@@ -271,7 +271,7 @@ def load_users():
                 "processed_posts": []
             }
         with open(USERS_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
             # Конвертируем в новый формат если нужно
             if not isinstance(data, dict) or "channels" not in data:
                 old_time = data.get("last_post_time")
@@ -285,6 +285,7 @@ def load_users():
                     }
                 }
             return data
+    except Exception as e:
         logging.error(f"Ошибка загрузки users: {e}")
         return {
             "channels": {
