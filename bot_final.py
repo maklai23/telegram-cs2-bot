@@ -543,18 +543,24 @@ def parse_faceit_simple(soup, url):
         text = soup.get_text(separator=" ", strip=True)
 
         # site-specific selectors
-        elif "faceitfinder" in url or "faceitplayerfinder" in url:
+        if "faceitfinder" in url or "faceitplayerfinder" in url:
             nickname = soup.select_one(".player-name")
             level = soup.select_one(".player-level")
             elo = soup.select_one(".player-elo")
+            steam_name = soup.select_one(".steam-name")  # Добавим получение steam_name
 
             if nickname:
                 stats["faceit_nick"] = nickname.text.strip()
-                steam_name_text = steam_name.text.strip()
-                if steam_name_text:
-                    stats["steam_name"] = steam_name_text
+            
+            if steam_name:
+                stats["steam_name"] = steam_name.text.strip()
 
-            if nickname:
+            if level:
+                stats["faceit_level"] = level.text.strip()
+            
+            if elo:
+                stats["ELO"] = elo.text.strip()
+
             # Steam профиль
             steam_rows = soup.select('.account-steaminfo-container .account-steaminfo-row')
             for row in steam_rows:
@@ -600,8 +606,6 @@ def parse_faceit_simple(soup, url):
                     stats['ADR'] = value_text
                 elif 'entry success rate' in text:
                     stats['entry_success'] = value_text
-                if m:
-                    stats["faceit_level"] = m.group(1)
 
             # собираем все блоки статистики (видимые и скрытые)
             blocks = soup.select('.account-faceit-stats')
