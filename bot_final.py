@@ -261,30 +261,24 @@ def load_last_post():
             }
         }
 
+def save_users(users_data):
+    """Сохранение данных пользователей"""
+    try:
+        with open(USERS_FILE, "w", encoding='utf-8') as f:
+            json.dump(users_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения users: {e}")
+
 def load_users():
-    """Загрузка состояния обработанных постов по каналам"""
+    """Загрузка данных пользователей"""
     try:
         if not os.path.exists(USERS_FILE):
-            return {
-                "channels": {},
-                "last_post_time": None,
-                "processed_posts": []
-            }
-        with open(USERS_FILE, "r") as f:
-            data = json.load(f)
-            # Конвертируем в новый формат если нужно
-            if not isinstance(data, dict) or "channels" not in data:
-                old_time = data.get("last_post_time")
-                old_posts = set(data.get("processed_posts", []))
-                data = {
-                    "channels": {
-                        channel: {
-                            "last_post_time": old_time,
-                            "processed_posts": list(old_posts)
-                        } for channel in TELEGRAM_CHANNELS
-                    }
-                }
-            return data
+            return {}
+        with open(USERS_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки users: {e}")
+        return {}
     except Exception as e:
         logging.error(f"Ошибка загрузки users: {e}")
         return {
@@ -699,7 +693,7 @@ async def get_telegram_posts(channel: str):
                 for message in messages:
                     try:
                         text_element = message.find('div', class_='tgme_widget_message_text')
-                        post_text = text_element.decode_contents() if text_element else ""  # Сохраняем HTML-версию текста
+                        # Получаем текст как есть, сохраняя эмодзи
                         post_text_plain = text_element.get_text(strip=True, separator='\n') if text_element else ""
 
                         time_element = message.find('time', class_='time')
@@ -729,9 +723,9 @@ async def get_telegram_posts(channel: str):
                                 'title': doc_title.text.strip() if doc_title else "Документ"
                             })
 
-                        if (post_text or photo_urls or video_urls or documents) and post_time:
+                        if (post_text_plain or photo_urls or video_urls or documents) and post_time:
                             post_data = {
-                                'text': post_text,
+                                'text_plain': post_text_plain,
                                 'time': post_time,
                                 'photo_urls': photo_urls,
                                 'video_urls': video_urls,
@@ -766,15 +760,18 @@ async def download_media(url):
 
 async def send_telegram_post(post, source_channel: str = None):
     try:
-        caption = "📢 <b>Новый пост из канала</b>\n\n"
+        caption = "📢 *Новый пост из канала*\n\n"
         
-        if post['text']:
-            text_preview = post['text'][:800] + ("..." if len(post['text']) > 800 else "")
-            caption += text_preview
+        if post['text_plain']:  # Используем plain текст для отправки
+            text = post['text_plain'][:800] + ("..." if len(post['text_plain']) > 800 else "")
+            # Экранируем специальные символы для MarkdownV2
+            escaped_text = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+            caption += escaped_text
         
         if post['url']:
-            escaped_url = escape_markdown_v2(post['url'])
-            caption += f"\n\n[Ссылка на пост]({escaped_url})"
+            # Экранируем только специальные символы в URL, сохраняя его структуру
+            escaped_url = re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', post['url'])
+            caption += f"\n\n[🔗 Оригинал]({escaped_url})"
 
         target_chat_id = TARGET_CHAT_ID
         # Роутинг по каналу: для retakenews используем отдельную тему
@@ -809,7 +806,7 @@ async def send_telegram_post(post, source_channel: str = None):
                         chat_id=target_chat_id,
                         photo=BufferedInputFile(photo_data, "photo.jpg"),
                         caption=caption,
-                        parse_mode="HTML",
+                        parse_mode="MarkdownV2",
                         **thread_kwargs
                     )
             else:
@@ -820,7 +817,7 @@ async def send_telegram_post(post, source_channel: str = None):
                         media = InputMediaPhoto(
                             media=BufferedInputFile(photo_data, f"photo_{i}.jpg"),
                             caption=caption if i == 0 else None,
-                            parse_mode="HTML" if i == 0 else None
+                            parse_mode="MarkdownV2" if i == 0 else None
                         )
                         media_group.append(media)
                 
@@ -838,7 +835,7 @@ async def send_telegram_post(post, source_channel: str = None):
                     chat_id=target_chat_id,
                     video=BufferedInputFile(video_data, "video.mp4"),
                     caption=caption,
-                    parse_mode="HTML",
+                    parse_mode="MarkdownV2",
                     **thread_kwargs
                 )
         
@@ -846,7 +843,7 @@ async def send_telegram_post(post, source_channel: str = None):
             await bot.send_message(
                 chat_id=target_chat_id,
                 text=caption,
-                parse_mode="HTML",
+                parse_mode="MarkdownV2",
                 disable_web_page_preview=False,
                 **thread_kwargs
             )
@@ -1130,6 +1127,8 @@ async def list_all_stats(message: types.Message):
 
     msg = "📊 *Статистика всех игроков:*\n\n"
     for tg_id, info in users.items():
+        if not info.get("steam_id"):
+            continue
         stats = await get_faceit_stats(info["steam_id"])
         if stats:
             # Обработка WinRate
