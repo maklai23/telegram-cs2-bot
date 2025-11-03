@@ -1045,7 +1045,7 @@ async def setup_topics_command(message: Message):
     
     args = message.text.split()
     
-    if len(args) != 4:
+    if len(args) != 5:
         await message.reply(
             "**Использование:**\n"
             "`/setup_topics <human_topic_id> <bot_topic_id> <news_topic_id>`\n\n"
@@ -1057,12 +1057,14 @@ async def setup_topics_command(message: Message):
         TOPIC_IDS["HUMAN_CHAT"] = int(args[1])
         TOPIC_IDS["BOT_CHAT"] = int(args[2]) 
         TOPIC_IDS["NEWS_CHAT"] = int(args[3])
+        TOPIC_IDS["NEWS_RETAKE_CHAT"] = int(args[4])  # По умолчанию та же тема для новостей ретейк
         
         await message.reply(
             "✅ **Темы настроены!**\n\n"
             f"💬 Общий чат: `{TOPIC_IDS['HUMAN_CHAT']}`\n"
             f"🤖 Бот Габен: `{TOPIC_IDS['BOT_CHAT']}`\n" 
-            f"📢 Новости CS2: `{TOPIC_IDS['NEWS_CHAT']}`"
+            f"📢 Новости CS2: `{TOPIC_IDS['NEWS_CHAT']}`\n"
+            f"📢 Новости CS2 Ретейк: `{TOPIC_IDS['NEWS_RETAKE_CHAT']}`"
         )
         
     except ValueError:
@@ -1199,7 +1201,7 @@ async def hard_reset_webhook():
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-            params = {"drop_pending_updates": True}
+            params = {"drop_pending_updates": "true"}
             async with session.get(url, params=params) as resp:
                 try:
                     logging.info(f"✅ Webhook reset response: {resp.status}")
