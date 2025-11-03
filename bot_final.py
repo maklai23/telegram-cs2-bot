@@ -710,12 +710,12 @@ async def send_telegram_post(post, source_channel: str = None):
 
         target_chat_id = TARGET_CHAT_ID
         # Роутинг по каналу: для retakenews используем отдельную тему
-            if source_channel and source_channel.lower() == "retakenews":
-                message_thread_id = TOPIC_IDS.get("NEWS_RETAKE_CHAT")
-                logging.info(f"🔄 Отправка в тему ретейк {message_thread_id}")
-            else:
-                message_thread_id = TOPIC_IDS.get("NEWS_CHAT")
-                logging.info(f"🔄 Отправка в общую тему {message_thread_id}")
+        if source_channel and source_channel.lower() == "retakenews":
+            message_thread_id = TOPIC_IDS.get("NEWS_RETAKE_CHAT")
+            logging.info(f"🔄 Отправка в тему ретейк {message_thread_id}")
+        else:
+            message_thread_id = TOPIC_IDS.get("NEWS_CHAT")
+            logging.info(f"🔄 Отправка в общую тему {message_thread_id}")
 
         thread_kwargs = {"message_thread_id": message_thread_id} if message_thread_id is not None else {}
 
