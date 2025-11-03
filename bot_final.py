@@ -523,14 +523,28 @@ def parse_faceit_simple(soup, url):
     """
     try:
         stats = {
+            # Steam данные
             "steam_name": "*",
+            "steam_kd": "*",
+            "steam_hs": "*",
+            "steam_winrate": "*",
+            "cs_hours": "*",
+            "cs2_hours_2weeks": "*",
+            
+            # Faceit данные
             "faceit_nick": "*",
-            "faceit_level": "*",
+            "region_rank": "*",
             "ELO": "*",
-            "Matches": "*",
+            "faceit_level": "*",
             "K/D": "*",
             "Winrt": "*",
-            "cs_hours": "*",
+            "Matches": "*",
+            "Wins": "*",
+            "headshots": "*",
+            "ADR": "*",
+            "entry_success": "*",
+            "recent_results": "*",
+            
             "source": url
         }
 
@@ -565,13 +579,15 @@ def parse_faceit_simple(soup, url):
                 value_text = value.text.strip()
 
                 if 'k/d ratio' in text:
-                    stats['K/D'] = value_text
-                elif 'headshot' in text:
-                    stats['headshots'] = value_text
+                    stats['steam_kd'] = value_text
+                elif 'headshot' in text or 'hs' in text:
+                    stats['steam_hs'] = value_text
                 elif 'winrate' in text:
-                    stats['Winrt'] = value_text
+                    stats['steam_winrate'] = value_text
                 elif 'cs total hours' in text:
                     stats['cs_hours'] = value_text.replace(',', '')
+                elif 'cs2 last 2 weeks' in text:
+                    stats['cs2_hours_2weeks'] = value_text.replace(',', '')
 
             # Faceit профиль
             faceit_rows = soup.select('.account-steaminfo-container ~ .account-steaminfo-container .account-steaminfo-row')
@@ -584,6 +600,8 @@ def parse_faceit_simple(soup, url):
 
                 if 'faceit nick' in text:
                     stats['faceit_nick'] = value_text
+                elif 'region rank' in text:
+                    stats['region_rank'] = value_text
                 elif 'elo' in text:
                     stats['ELO'] = value_text
                 elif 'skill level' in text:
@@ -594,10 +612,22 @@ def parse_faceit_simple(soup, url):
                     stats['Winrt'] = value_text
                 elif 'matches' in text:
                     stats['Matches'] = value_text
-                elif 'headshot' in text:
+                elif 'wins' in text:
+                    stats['Wins'] = value_text
+                elif 'headshot' in text or 'hs' in text:
                     stats['headshots'] = value_text
                 elif 'adr' in text:
                     stats['ADR'] = value_text
+                elif 'entry success' in text:
+                    stats['entry_success'] = value_text
+
+            # Recent Results
+            recent_results = []
+            result_items = soup.select('.recent-results-item')
+            for item in result_items[:5]:  # берем последние 5 матчей
+                result = item.get_text(strip=True)
+                recent_results.append(result)
+            stats['recent_results'] = ' '.join(recent_results) if recent_results else '*'
                 elif 'entry success rate' in text:
                     stats['entry_success'] = value_text
 
@@ -668,7 +698,7 @@ def parse_faceit_simple(soup, url):
         return None
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
-    text_hash = hash(post['text'][:100] if post['text'] else "media") % 10000
+    text_hash = hash(post['text_plain'][:100] if post['text_plain'] else "media") % 10000
     return f"{post['time']}_{text_hash}"
 
 async def get_telegram_posts(channel: str):
@@ -1043,10 +1073,38 @@ async def stats_command(message: Message):
         await loading_msg.edit_text("❌ Не удалось получить статистику.")
         return
 
-    # Форматируем текст с учетом возможных отсутствующих данных
-    winrate = stats.get('Winrt', '?')
-    if winrate != '?' and not winrate.endswith('%'):
-        winrate = f"{winrate}%"
+    text = "📊 *Статистика игрока*\n\n"
+    
+    # Steam Stats
+    text += "🎮 *Steam статистика:*\n"
+    text += f"• Ник: `{escape_markdown_v2(str(stats['steam_name']))}`\n"
+    text += f"• K/D: `{stats.get('steam_kd', '?')}`\n"
+    text += f"• Процент HS: `{stats.get('steam_hs', '?')}`\n"
+    text += f"• Винрейт: `{stats.get('steam_winrate', '?')}`\n"
+    text += f"• Часы CS: `{stats.get('cs_hours', '?')}`\n"
+    text += f"• Часы CS2 (2 недели): `{stats.get('cs2_hours_2weeks', '?')}`\n\n"
+    
+    # Faceit Stats
+    text += "🎯 *Faceit статистика:*\n"
+    text += f"• Ник: `{escape_markdown_v2(str(stats['faceit_nick']))}`\n"
+    text += f"• Ранг в регионе: `{stats.get('region_rank', '?')}`\n"
+    text += f"• ELO: `{stats.get('ELO', '?')}`\n"
+    text += f"• Уровень: `{stats.get('faceit_level', '?')}`\n"
+    text += f"• K/D: `{stats.get('K/D', '?')}`\n"
+    text += f"• Винрейт: `{stats.get('Winrt', '?')}`\n"
+    text += f"• Матчей: `{stats.get('Matches', '?')}`\n"
+    text += f"• Побед: `{stats.get('Wins', '?')}`\n"
+    text += f"• Процент HS: `{stats.get('headshots', '?')}`\n"
+    text += f"• ADR: `{stats.get('ADR', '?')}`\n"
+    text += f"• Entry Success Rate: `{stats.get('entry_success', '?')}`\n"
+    
+    if stats.get('recent_results') != '*':
+        text += f"• Последние матчи: `{stats.get('recent_results', '?')}`\n"
+    
+    text += f"\n🔗 *SteamID:* `{users[tg_id]['steam_id']}`\n"
+    text += f"📡 *Источник:* `{stats.get('source', '?')}`"
+    
+    await loading_msg.edit_text(text, parse_mode="MarkdownV2")
 
     # Создаем информативное сообщение
     lines = [
@@ -1138,9 +1196,27 @@ async def list_all_stats(message: types.Message):
                 if winrate.replace('.', '').isdigit():
                     winrate = f"{winrate}%"
                     
-            msg += f"*{escape_markdown_v2(info['faceit_nick'])}:*\n"
-            msg += f"• Level: `{stats['faceit_level']}` • ELO: `{stats.get('ELO','?')}`\n"
-            msg += f"• K/D: `{stats.get('K/D','?')}` • WinRate: `{winrate}`\n\n"
+            escaped_nick = escape_markdown_v2(info.get('faceit_nick', stats['steam_name']))
+            msg += f"*{escaped_nick}:*\n"
+            
+            # Steam Stats
+            msg += "🎮 *Steam:*\n"
+            msg += f"• Имя: `{escape_markdown_v2(str(stats['steam_name']))}`\n"
+            msg += f"• K/D: `{stats.get('steam_kd','?')}` • HS: `{stats.get('steam_hs','?')}`\n"
+            msg += f"• WinRate: `{stats.get('steam_winrate','?')}` • Часы CS: `{stats.get('cs_hours','?')}`\n"
+            msg += f"• Часы CS2 (2 нед.): `{stats.get('cs2_hours_2weeks','?')}`\n\n"
+            
+            # Faceit Stats
+            msg += "🎯 *Faceit:*\n"
+            msg += f"• Ранг региона: `{stats.get('region_rank','?')}`\n"
+            msg += f"• ELO: `{stats.get('ELO','?')}` • Уровень: `{stats.get('faceit_level','?')}`\n"
+            msg += f"• K/D: `{stats.get('K/D','?')}` • WinRate: `{stats.get('Winrt','?')}`\n"
+            msg += f"• Матчи: `{stats.get('Matches','?')}` • Победы: `{stats.get('Wins','?')}`\n"
+            msg += f"• HS: `{stats.get('headshots','?')}` • ADR: `{stats.get('ADR','?')}`\n"
+            msg += f"• Entry Success: `{stats.get('entry_success','?')}`\n"
+            if stats.get('recent_results') != '*':
+                msg += f"• Последние матчи: `{stats.get('recent_results','?')}`\n"
+            msg += "\n"
 
     await message.reply(msg, parse_mode="Markdown")
 
