@@ -253,26 +253,53 @@ def save_last_post(post_time, processed_posts):
         logging.error(f"Ошибка сохранения last_post: {e}")
 
 def load_users():
+    """Загрузка состояния обработанных постов по каналам"""
     try:
         if not os.path.exists(USERS_FILE):
-            return {}
+            return {
+                "channels": {},
+                "last_post_time": None,
+                "processed_posts": []
+            }
         with open(USERS_FILE, "r") as f:
             return json.load(f)
-    except Exception as e:
+            # Конвертируем в новый формат если нужно
+            if not isinstance(data, dict) or "channels" not in data:
+                old_time = data.get("last_post_time")
+                old_posts = set(data.get("processed_posts", []))
+                data = {
+                    "channels": {
+                        channel: {
+                            "last_post_time": old_time,
+                            "processed_posts": list(old_posts)
+                        } for channel in TELEGRAM_CHANNELS
+                    }
+                }
+            return data
         logging.error(f"Ошибка загрузки users: {e}")
-        return {}
+        return {
+            "channels": {
+                channel: {
+                    "last_post_time": None,
+                    "processed_posts": []
+                } for channel in TELEGRAM_CHANNELS
+            }
+        }
 
-def save_users(users):
+def save_last_post(channel: str, post_time, processed_posts):
+    """Сохранение состояния обработанных постов для конкретного канала"""
     try:
-        with open(USERS_FILE, "w") as f:
-            json.dump(users, f, indent=4)
-        # Автоматический backup в GitHub
-        asyncio.create_task(async_backup_to_github())
-    except Exception as e:
+        data = load_last_post()
+        if "channels" not in data:
+            data["channels"] = {}
+        data["channels"][channel] = {
+            "last_post_time": post_time,
+            "processed_posts": list(processed_posts)
+        }
         logging.error(f"Ошибка сохранения users: {e}")
-
+            json.dump(data, f, indent=2)
 def load_events():
-    try:
+        logging.error(f"❌ Ошибка сохранения last_post для канала {channel}: {e}")
         if not os.path.exists(EVENTS_FILE):
             return {}
         with open(EVENTS_FILE, "r", encoding="utf-8") as f:
@@ -500,40 +527,63 @@ def parse_faceit_simple(soup, url):
         text = soup.get_text(separator=" ", strip=True)
 
         # site-specific selectors
-        if "faceitstats.com" in url:
+        elif "faceitfinder" in url or "faceitplayerfinder" in url:
             nickname = soup.select_one(".player-name")
             level = soup.select_one(".player-level")
             elo = soup.select_one(".player-elo")
 
             if nickname:
                 stats["faceit_nick"] = nickname.text.strip()
-            if level:
-                stats["faceit_level"] = level.text.strip()
-            if elo:
-                stats["ELO"] = elo.text.strip()
-
-        elif "tracker.gg" in url:
-            nickname = soup.select_one(".trn-profile-header__name")
-            level_elem = soup.select_one(".faceit-level .value")
+                steam_name_text = steam_name.text.strip()
+                if steam_name_text:
+                    stats["steam_name"] = steam_name_text
 
             if nickname:
-                stats["faceit_nick"] = nickname.text.strip()
-            if level_elem:
-                stats["faceit_level"] = level_elem.text.strip()
+            # Steam профиль
+            steam_rows = soup.select('.account-steaminfo-container .account-steaminfo-row')
+            for row in steam_rows:
+                text = row.get_text(separator=' ', strip=True).lower()
+                value = row.select_one('.account-steaminfo-row-value')
+                if not value:
+                    continue
+                value_text = value.text.strip()
 
-        # Faceitfinder: есть блоки .account-faceit-stats с div.account-faceit-stats-single
-        if "faceitfinder" in url:
-            steam_name = soup.select_one(".account-steam-name span") or soup.select_one(".account-steam-name")
-            faceit_nick = soup.select_one(".account-faceit-title-username") or soup.select_one(".account-faceit-title")
-            faceit_level_img = soup.select_one(".account-faceit-level img") or soup.select_one(".faceit-level img")
+                if 'k/d ratio' in text:
+                    stats['K/D'] = value_text
+                elif 'headshot' in text:
+                    stats['headshots'] = value_text
+                elif 'winrate' in text:
+                    stats['Winrt'] = value_text
+                elif 'cs total hours' in text:
+                    stats['cs_hours'] = value_text.replace(',', '')
 
-            if steam_name:
-                stats["steam_name"] = steam_name.text.strip()
-            if faceit_nick:
-                stats["faceit_nick"] = faceit_nick.text.strip()
-            if faceit_level_img:
-                alt = faceit_level_img.get("alt", "")
-                m = re.search(r"(\d+)", alt)
+            # Faceit профиль
+            faceit_rows = soup.select('.account-steaminfo-container ~ .account-steaminfo-container .account-steaminfo-row')
+            for row in faceit_rows:
+                text = row.get_text(separator=' ', strip=True).lower()
+                value = row.select_one('.account-steaminfo-row-value')
+                if not value:
+                    continue
+                value_text = value.text.strip()
+
+                if 'faceit nick' in text:
+                    stats['faceit_nick'] = value_text
+                elif 'elo' in text:
+                    stats['ELO'] = value_text
+                elif 'skill level' in text:
+                    stats['faceit_level'] = value_text
+                elif 'kd/ratio' in text:
+                    stats['K/D'] = value_text
+                elif 'winrate' in text:
+                    stats['Winrt'] = value_text
+                elif 'matches' in text:
+                    stats['Matches'] = value_text
+                elif 'headshot' in text:
+                    stats['headshots'] = value_text
+                elif 'adr' in text:
+                    stats['ADR'] = value_text
+                elif 'entry success rate' in text:
+                    stats['entry_success'] = value_text
                 if m:
                     stats["faceit_level"] = m.group(1)
 
@@ -791,11 +841,15 @@ async def send_telegram_post(post, source_channel: str = None):
         return False
 
 async def check_telegram_channel(channel: str):
+    logging.info(f"🔍 Проверка канала {channel}")
     posts = await get_telegram_posts(channel)
     if not posts:
         return
     
-    last_post_time, processed_posts = load_last_post()
+    data = load_last_post()
+    channel_data = data.get("channels", {}).get(channel, {"last_post_time": None, "processed_posts": []})
+    last_post_time = channel_data["last_post_time"]
+    processed_posts = set(channel_data["processed_posts"])
     new_posts_found = 0
     latest_post_time = last_post_time
     
@@ -813,7 +867,7 @@ async def check_telegram_channel(channel: str):
                 await asyncio.sleep(1)
     
     if new_posts_found > 0:
-        save_last_post(latest_post_time, processed_posts)
+        save_last_post(channel, latest_post_time, processed_posts)
         logging.info(f"✅ Обработано {new_posts_found} новых постов")
 
 async def scheduled_channel_check():
