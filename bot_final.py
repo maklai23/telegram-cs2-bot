@@ -295,6 +295,7 @@ def load_users():
             }
         }
 
+
 def save_last_post(channel: str, post_time, processed_posts):
     """Сохранение состояния обработанных постов для конкретного канала"""
     try:
@@ -310,6 +311,7 @@ def save_last_post(channel: str, post_time, processed_posts):
         asyncio.create_task(async_backup_to_github())
     except Exception as e:
         logging.error(f"❌ Ошибка сохранения last_post для канала {channel}: {e}")
+
 
 def load_events():
     try:
@@ -692,7 +694,8 @@ async def get_telegram_posts(channel: str):
                 for message in messages:
                     try:
                         text_element = message.find('div', class_='tgme_widget_message_text')
-                        post_text = text_element.get_text(strip=True, separator='\n') if text_element else ""
+                        post_text = text_element.decode_contents() if text_element else ""  # Сохраняем HTML-версию текста
+                        post_text_plain = text_element.get_text(strip=True, separator='\n') if text_element else ""
 
                         time_element = message.find('time', class_='time')
                         post_time = time_element['datetime'] if time_element and 'datetime' in time_element.attrs else None
@@ -758,13 +761,10 @@ async def download_media(url):
 
 async def send_telegram_post(post, source_channel: str = None):
     try:
-        clean_text = clean_markdown_text(post['text']) if post['text'] else ""
-        escaped_text = escape_markdown_v2(clean_text)
+        caption = "📢 <b>Новый пост из канала</b>\n\n"
         
-        caption = "📢 *Новый пост из канала*\n\n"
-        
-        if clean_text:
-            text_preview = escaped_text[:800] + ("\\.\\.\\." if len(clean_text) > 800 else "")
+        if post['text']:
+            text_preview = post['text'][:800] + ("..." if len(post['text']) > 800 else "")
             caption += text_preview
         
         if post['url']:
@@ -804,7 +804,7 @@ async def send_telegram_post(post, source_channel: str = None):
                         chat_id=target_chat_id,
                         photo=BufferedInputFile(photo_data, "photo.jpg"),
                         caption=caption,
-                        parse_mode="MarkdownV2",
+                        parse_mode="HTML",
                         **thread_kwargs
                     )
             else:
@@ -815,7 +815,7 @@ async def send_telegram_post(post, source_channel: str = None):
                         media = InputMediaPhoto(
                             media=BufferedInputFile(photo_data, f"photo_{i}.jpg"),
                             caption=caption if i == 0 else None,
-                            parse_mode="MarkdownV2" if i == 0 else None
+                            parse_mode="HTML" if i == 0 else None
                         )
                         media_group.append(media)
                 
@@ -833,7 +833,7 @@ async def send_telegram_post(post, source_channel: str = None):
                     chat_id=target_chat_id,
                     video=BufferedInputFile(video_data, "video.mp4"),
                     caption=caption,
-                    parse_mode="MarkdownV2",
+                    parse_mode="HTML",
                     **thread_kwargs
                 )
         
@@ -841,7 +841,7 @@ async def send_telegram_post(post, source_channel: str = None):
             await bot.send_message(
                 chat_id=target_chat_id,
                 text=caption,
-                parse_mode="MarkdownV2",
+                parse_mode="HTML",
                 disable_web_page_preview=False,
                 **thread_kwargs
             )
