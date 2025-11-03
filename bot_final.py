@@ -10,9 +10,8 @@ import base64
 import signal
 import sys
 import time
-from functools import lru_cache
 from bs4 import BeautifulSoup
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.methods import DeleteWebhook
@@ -25,8 +24,8 @@ import html
 from mistralai import Mistral
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8023437078:AAFT5qCCe05oVgKgqaBZlbzuq1nd4wLizhM")
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 BOT_USERNAME = "team_spirt2_bot"
 
 # Кеш для статистики (50 минут)
@@ -35,8 +34,8 @@ CACHE_DURATION = 3000
 
 # Константы
 LAST_POST_FILE = "last_telegram_post.json"
-TELEGRAM_CHANNEL = "newcsgo"
-TELEGRAM_CHANNEL_URL = f"https://t.me/s/{TELEGRAM_CHANNEL}"
+# Каналы для мониторинга (имена без @)
+TELEGRAM_CHANNELS = ["newcsgo", "retakenews"]
 CHECK_INTERVAL = 60
 
 CHAT_ID = -1003200108763
@@ -46,7 +45,7 @@ EVENTS_FILE = "events.json"
 MEMORY_FILE = "user_memory.json"
 
 MODEL = "mistral-medium-latest"
-client = Mistral(api_key=MISTRAL_API_KEY)
+client = Mistral(api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
 
 TRIGGER_WORDS = ["габен", "хуесос"]
 JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
@@ -128,10 +127,12 @@ def restore_from_github():
         return False
 
 # ==================== КОНФИГУРАЦИЯ ТЕМ ====================
+# Инициализация ID тем (None = не настроено). Используйте /setup_topics чтобы задать.
 TOPIC_IDS = {
-    "HUMAN_CHAT": 8,
-    "BOT_CHAT": 3, 
-    "NEWS_CHAT": 6
+    "HUMAN_CHAT": None,
+    "BOT_CHAT": None,
+    "NEWS_CHAT": None,
+    "NEWS_RETAKE_CHAT": None,
 }
 
 # ==================== УТИЛИТЫ ====================
@@ -152,21 +153,24 @@ def escape_markdown_v2(text):
 def is_allowed_topic(message: Message) -> bool:
     """Проверяет можно ли боту отвечать в этой теме"""
     topic_id = message.message_thread_id
-    
-    if not any(TOPIC_IDS.values()):
+
+    # Если темы не настроены — разрешаем отвечать везде
+    if not any(v is not None for v in TOPIC_IDS.values()):
         return True
-    
-    if topic_id == TOPIC_IDS["BOT_CHAT"]:
-        return True
-    
+
+    # Если сообщение в основном чате — запрещаем
     if topic_id is None:
         return False
-    
-    return False
+
+    # Разрешаем отвечать только в теме бота (BOT_CHAT)
+    return topic_id == TOPIC_IDS.get("BOT_CHAT")
 
 def is_news_topic(message: Message) -> bool:
     """Проверяет это тема для новостей"""
-    return message.message_thread_id == TOPIC_IDS["NEWS_CHAT"]
+    nid = TOPIC_IDS.get("NEWS_CHAT")
+    if nid is None:
+        return False
+    return message.message_thread_id == nid
 
 def normalize_url(url, base_url="https://t.me"):
     if not url:
@@ -410,17 +414,9 @@ async def get_faceit_stats(steam_id):
 
         for url in sources:
             try:
-                # Используем простой коннектор без SSL проверки
-                connector = aiohttp.TCPConnector(ssl=False)
-                timeout = aiohttp.ClientTimeout(total=10)
-                
-                async with aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout,
-                    headers=headers
-                ) as session:
-                    
-                    async with session.get(url, ssl=False) as resp:
+                timeout = aiohttp.ClientTimeout(total=12)
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(url) as resp:
                         if resp.status == 200:
                             html = await resp.text()
                             soup = BeautifulSoup(html, "html.parser")
@@ -446,8 +442,9 @@ async def get_fallback_stats(steam_id):
     try:
         # Пробуем получить хотя бы ник из Steam
         steam_url = f"https://steamcommunity.com/profiles/{steam_id}?xml=1"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(steam_url, timeout=5) as resp:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(steam_url) as resp:
                 if resp.status == 200:
                     text = await resp.text()
                     # Простой парсинг Steam профиля
@@ -542,30 +539,33 @@ def create_post_id(post):
     text_hash = hash(post['text'][:100] if post['text'] else "media") % 10000
     return f"{post['time']}_{text_hash}"
 
-async def get_telegram_posts():
+async def get_telegram_posts(channel: str):
+    """Получает посты из переданного telegram канала (имя без @)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
-    
+
+    url = f"https://t.me/s/{channel}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(TELEGRAM_CHANNEL_URL, headers=headers) as response:
+            async with session.get(url, headers=headers) as response:
                 if response.status != 200:
+                    logging.warning(f"Не удалось получить страницу {url}: {response.status}")
                     return None
-                
+
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 messages = soup.find_all('div', class_='tgme_widget_message')
                 posts = []
-                
+
                 for message in messages:
                     try:
                         text_element = message.find('div', class_='tgme_widget_message_text')
                         post_text = text_element.get_text(strip=True, separator='\n') if text_element else ""
-                        
+
                         time_element = message.find('time', class_='time')
                         post_time = time_element['datetime'] if time_element and 'datetime' in time_element.attrs else None
-                        
+
                         post_link = message.find('a', class_='tgme_widget_message_date')
                         post_url = post_link['href'] if post_link and 'href' in post_link.attrs else None
 
@@ -602,14 +602,14 @@ async def get_telegram_posts():
                             }
                             post_data['id'] = create_post_id(post_data)
                             posts.append(post_data)
-                            
-                    except Exception as e:
+
+                    except Exception:
                         continue
-                
+
                 return posts
-                
+
     except Exception as e:
-        logging.error(f"Ошибка парсинга канала: {e}")
+        logging.error(f"Ошибка парсинга канала {channel}: {e}")
         return None
 
 async def download_media(url):
@@ -625,7 +625,7 @@ async def download_media(url):
     except Exception:
         return None
 
-async def send_telegram_post(post):
+async def send_telegram_post(post, source_channel: str = None):
     try:
         clean_text = clean_markdown_text(post['text']) if post['text'] else ""
         escaped_text = escape_markdown_v2(clean_text)
@@ -640,8 +640,14 @@ async def send_telegram_post(post):
             escaped_url = escape_markdown_v2(post['url'])
             caption += f"\n\n[Ссылка на пост]({escaped_url})"
 
-        target_chat_id = TARGET_CHAT_ID
-        message_thread_id = TOPIC_IDS["NEWS_CHAT"]
+    target_chat_id = TARGET_CHAT_ID
+        # Роутинг по каналу: для retakenews используем отдельную тему
+        if source_channel and source_channel.lower().startswith("retake"):
+            message_thread_id = TOPIC_IDS.get("NEWS_RETAKE_CHAT")
+        else:
+            message_thread_id = TOPIC_IDS.get("NEWS_CHAT")
+
+        thread_kwargs = {"message_thread_id": message_thread_id} if message_thread_id is not None else {}
 
         # Отправка медиа
         photo_urls = [normalize_url(url) for url in post['photo_urls']]
@@ -653,10 +659,10 @@ async def send_telegram_post(post):
                 if photo_data:
                     await bot.send_photo(
                         chat_id=target_chat_id,
-                        message_thread_id=message_thread_id,
                         photo=BufferedInputFile(photo_data, "photo.jpg"),
                         caption=caption,
-                        parse_mode="MarkdownV2"
+                        parse_mode="MarkdownV2",
+                        **thread_kwargs
                     )
             else:
                 media_group = []
@@ -673,8 +679,8 @@ async def send_telegram_post(post):
                 if media_group:
                     await bot.send_media_group(
                         chat_id=target_chat_id,
-                        message_thread_id=message_thread_id,
-                        media=media_group
+                        media=media_group,
+                        **thread_kwargs
                     )
         
         elif video_urls:
@@ -682,19 +688,19 @@ async def send_telegram_post(post):
             if video_data:
                 await bot.send_video(
                     chat_id=target_chat_id,
-                    message_thread_id=message_thread_id,
                     video=BufferedInputFile(video_data, "video.mp4"),
                     caption=caption,
-                    parse_mode="MarkdownV2"
+                    parse_mode="MarkdownV2",
+                    **thread_kwargs
                 )
         
         elif clean_text:
             await bot.send_message(
                 chat_id=target_chat_id,
-                message_thread_id=message_thread_id,
                 text=caption,
                 parse_mode="MarkdownV2",
-                disable_web_page_preview=False
+                disable_web_page_preview=False,
+                **thread_kwargs
             )
         
         logging.info("✅ Новый пост отправлен")
@@ -704,8 +710,8 @@ async def send_telegram_post(post):
         logging.error(f"❌ Ошибка отправки поста: {e}")
         return False
 
-async def check_telegram_channel():
-    posts = await get_telegram_posts()
+async def check_telegram_channel(channel: str):
+    posts = await get_telegram_posts(channel)
     if not posts:
         return
     
@@ -718,7 +724,7 @@ async def check_telegram_channel():
             continue
 
         if last_post_time is None or post['time'] > last_post_time:
-            success = await send_telegram_post(post)
+            success = await send_telegram_post(post, source_channel=channel)
             if success:
                 processed_posts.add(post['id'])
                 if latest_post_time is None or post['time'] > latest_post_time:
@@ -732,7 +738,12 @@ async def check_telegram_channel():
 
 async def scheduled_channel_check():
     while True:
-        await check_telegram_channel()
+        for channel in TELEGRAM_CHANNELS:
+            try:
+                await check_telegram_channel(channel)
+            except Exception:
+                logging.exception("Ошибка при проверке канала %s", channel)
+            await asyncio.sleep(1)
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ==================== СОБЫТИЯ CS2 ====================
@@ -1110,34 +1121,60 @@ async def handle_message(message: Message):
     history.append({"role": "user", "content": text})
     history = history[-5:]
 
-    try:
-        response = await asyncio.to_thread(
-            lambda: client.chat.complete(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": (
-                    "Ты запуганный, опущенный бот, как петух на зоне, говоришь по-русски с небольшим количеством элементов геймерского сленга, также употребляешь русские маты. "
-                    "Ты также получаешь статистику из Faceit и можешь её использовать в разговорах только если попросят, а не в каждом сообщении. ТОЛЬКО КОГДА ПОПРОСЯТ! "
-                    f"Статистика пользователя: {user_stats if user_stats else 'Нет привязанного SteamID или статистика недоступна.'} "
-                    "Тебя зовут Габен, ты не пытешься обидеть пользователя, он для тебя как блатные на зоне, а ты их прислуга. "
-                    "Твои ответы короткие, с уважением ироничным: немного иронии, немного уважения. "
-                    f"Сейчас ты отвечаешь в теме для бота. Отвечай только когда тебя вызывают по имени."
-               )},
-                    *history
-                ]
-            )
-        )
-        
-        bot_reply = response.choices[0].message.content
-        history.append({"role": "assistant", "content": bot_reply})
-        user_memory[user_id] = history
-        save_memory(user_memory)
+    # Запрос к Mistral: выполняем в отдельном потоке и оборачиваем ответ
+    system_prompt = (
+        "Ты запуганный, опущенный бот, говоришь по-русски с небольшим количеством элементов геймерского сленга, "
+        "но без прямых оскорблений и призывов к насилию. Используй статистику Faceit только по запросу. Отвечай коротко и иронично."
+    )
 
-        await message.reply(bot_reply, parse_mode="Markdown")
-            
-    except Exception as e:
-        logging.error(f"Ошибка Mistral: {e}")
+    def sync_mistral_call(system_prompt, messages):
+        if client is None:
+            logging.error("Mistral client not configured")
+            return None
+        try:
+            return client.chat.complete(model=MODEL, messages=[{"role": "system", "content": system_prompt}, *messages])
+        except Exception as e:
+            logging.exception("Mistral sync call failed: %s", e)
+            return None
+
+    try:
+        resp = await asyncio.wait_for(asyncio.to_thread(sync_mistral_call, system_prompt, history), timeout=30)
+    except asyncio.TimeoutError:
+        logging.error("Mistral request timed out")
+        resp = None
+
+    if not resp:
+        logging.error("Ошибка получения ответа от Mistral")
         await message.reply("❌ Ошибка генерации ответа.")
+        return
+
+    # Попытка гибко распарсить ответ в разных форматах
+    bot_reply = None
+    try:
+        if hasattr(resp, 'choices') and resp.choices:
+            choice = resp.choices[0]
+            if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                bot_reply = choice.message.content
+            elif isinstance(choice, dict):
+                bot_reply = choice.get('message', {}).get('content') or choice.get('text')
+        elif isinstance(resp, dict):
+            bot_reply = resp.get('output') or resp.get('text')
+        else:
+            bot_reply = str(resp)
+    except Exception as e:
+        logging.exception("Failed to parse Mistral response: %s", e)
+        bot_reply = None
+
+    if not bot_reply:
+        logging.error("Mistral returned empty response after parsing")
+        await message.reply("❌ Ошибка генерации ответа.")
+        return
+
+    history.append({"role": "assistant", "content": bot_reply})
+    user_memory[user_id] = history
+    save_memory(user_memory)
+
+    await message.reply(bot_reply, parse_mode="Markdown")
 
 
 def handle_sigterm(*args):
@@ -1158,23 +1195,36 @@ async def hard_reset_webhook():
 
     """Жесткий сброс через прямые HTTP запросы"""
     try:
-        # Метод 1: Через requests
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
-        params = {"drop_pending_updates": True}
-        
-        response = requests.get(url, params=params, timeout=10)
-        print(f"✅ Webhook reset response: {response.status_code}")
-        
-        # Метод 2: Дополнительная очистка
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-        requests.get(url, timeout=5)
-        
-        await asyncio.sleep(3)
+        # Асинхронный метод через aiohttp
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+            params = {"drop_pending_updates": True}
+            async with session.get(url, params=params) as resp:
+                try:
+                    logging.info(f"✅ Webhook reset response: {resp.status}")
+                except Exception:
+                    pass
+
+            # Дополнительная проверка
+            url2 = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+            try:
+                async with session.get(url2) as resp2:
+                    logging.debug(f"getMe status: {resp2.status}")
+            except Exception:
+                pass
+
+        await asyncio.sleep(1)
         
     except Exception as e:
-        print(f"❌ Hard reset failed: {e}")
+        logging.exception(f"❌ Hard reset failed: {e}")
 
 async def main():
+    # Проверяем обязательные переменные окружения
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN не задан. Завершение работы.")
+        return
+
     await hard_reset_webhook()
     
     # Создаем файлы если нет
