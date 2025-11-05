@@ -20,7 +20,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
-from aiogram.utils.markdown import escape_md
 import html
 from mistralai import Mistral
 from faceit_api import get_player_text_card, get_multiple_players_text, get_player_stats, clear_cache, get_player_full_card
@@ -58,6 +57,13 @@ JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # формат: username/repo
 BACKUP_FILES = [USERS_FILE, EVENTS_FILE, MEMORY_FILE, LAST_POST_FILE]
+
+def escape_md(text: str) -> str:
+    """
+    Экранирует все специальные символы MarkdownV2
+    """
+    # Список символов, которые нужно экранировать
+    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 def backup_to_github():
     if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -754,7 +760,6 @@ async def handle_event_time(message: types.Message):
     await message.reply(f"✅ Сбор на CS2 назначен на {hh:02d}:{mm:02d}!")
     asyncio.create_task(check_event(user_event["chat_id"], hh, mm))
 
-@dp.message(Command("stats"))
 async def stats_command(message: Message):
     if not is_allowed_topic(message):
         return
@@ -785,6 +790,9 @@ async def stats_command(message: Message):
         await loading_msg.edit_text("❌ Не удалось получить статистику через Faceit API.")
         return
 
+    # экранируем перед отправкой
+    card = escape_md(card)
+
     # Разбиваем длинное сообщение на части
     chunks = [card[i:i+MAX_CHUNK] for i in range(0, len(card), MAX_CHUNK)]
     await loading_msg.delete()
@@ -800,7 +808,7 @@ async def clear_faceit_cache_cmd(message: Message):
     await message.reply("✅ Faceit cache очищен.")
 
 @dp.message(Command("list_all_stats"))
-async def list_all_stats(message: types.Message):
+aasync def list_all_stats(message: types.Message):
     if not is_allowed_topic(message):
         return
 
@@ -830,6 +838,9 @@ async def list_all_stats(message: types.Message):
     if not full_text:
         await message.reply("❌ Не удалось собрать статистику ни для одного пользователя.")
         return
+
+    # Экранируем весь текст перед отправкой
+    full_text = escape_md(full_text)
 
     # Разбиваем на безопасные для Telegram части
     chunks = [full_text[i:i+MAX_CHUNK] for i in range(0, len(full_text), MAX_CHUNK)]

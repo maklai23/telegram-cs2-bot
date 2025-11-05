@@ -3,8 +3,8 @@ import aiohttp
 import asyncio
 import time
 import logging
+import re
 from typing import Optional, Dict, Any
-from aiogram.utils.markdown import escape_md
 
 
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or os.getenv("FACEIT_KEY") or os.getenv("FACEIT")  # Railway var
@@ -58,6 +58,13 @@ async def _get_player_by_nickname(nickname: str) -> Optional[dict]:
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         return await _fetch_json(session, url, params=params)
+
+def escape_md(text: str) -> str:
+    """
+    Экранирует все специальные символы MarkdownV2
+    """
+    # Список символов, которые нужно экранировать
+    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 async def _get_player_by_steamid(steam_id: str) -> Optional[dict]:
     """GET /players?game_player_id=<steamid> — fallback"""
