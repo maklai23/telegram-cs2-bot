@@ -808,7 +808,7 @@ async def clear_faceit_cache_cmd(message: Message):
     await message.reply("✅ Faceit cache очищен.")
 
 @dp.message(Command("list_all_stats"))
-aasync def list_all_stats(message: types.Message):
+async def list_all_stats(message: types.Message):
     if not is_allowed_topic(message):
         return
 
