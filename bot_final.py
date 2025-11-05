@@ -771,7 +771,9 @@ async def stats_command(message: Message):
     steam_id = user_info.get("steam_id")
 
     try:
+        logging.info(f"Запрос Faceit для {faceit_nick=} / {steam_id=}")
         card = await get_player_text_card(faceit_nick, steam_id, use_cache=True)
+        logging.info(f"Результат Faceit: {card}")
     except Exception as e:
         logging.exception("Ошибка при запросе Faceit: %s", e)
         card = None
