@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 import html
 from mistralai import Mistral
+from faceit_api import get_player_text_card, get_multiple_players_text, get_player_stats, clear_cache
 
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8331249759:AAFjxWonHiDbenOnr9lNpdJ7v1Y6UJAJ56w")
@@ -29,108 +30,379 @@ MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "V68jKeWkbgouyImfFx7rHS7Rwdw
 BOT_USERNAME = "team_spirt2_bot"
 
 # Кеш для статистики (50 минут)
-# ==================== FACEIT API ====================
-from faceit_client import get_stats_cached as faceit_api_get_stats, clear_cache as faceit_clear_cache
+faceit_cache = {}
+CACHE_DURATION = 3000
 
+# Константы
+LAST_POST_FILE = "last_telegram_post.json"
+# Каналы для мониторинга (имена без @)
+TELEGRAM_CHANNELS = ["newcsgo", "retakenews"]
+CHECK_INTERVAL = 60
 
-async def get_faceit_stats(steam_id):
-    """Получение статистики через официальный Faceit API (через faceit_client).
-    В качестве fallback использует Steam профиль, если API недоступен.
+CHAT_ID = -1003200108763
+TARGET_CHAT_ID = CHAT_ID
+USERS_FILE = "users.json"
+EVENTS_FILE = "events.json"
+MEMORY_FILE = "user_memory.json"
+
+MODEL = "mistral-medium-latest"
+client = Mistral(api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
+
+TRIGGER_WORDS = ["габен", "хуесос"]
+JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
+
+# ==================== GITHUB СИНХРОНИЗАЦИЯ ====================
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # формат: username/repo
+BACKUP_FILES = [USERS_FILE, EVENTS_FILE, MEMORY_FILE, LAST_POST_FILE]
+
+def backup_to_github():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    
+    try:
+        for filename in BACKUP_FILES:
+            if os.path.exists(filename):
+                with open(filename, "r", encoding="utf-8") as f:
+                    content = f.read()
+                
+                # Кодируем в base64 для GitHub API
+                encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+                
+                # Проверяем существует ли файл в репозитории
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+                headers = {
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                
+                response = requests.get(url, headers=headers)
+                
+                if response.status_code == 200:
+                    # Файл существует - обновляем
+                    sha = response.json()["sha"]
+                    data = {
+                        "message": f"Backup {filename}",
+                        "content": encoded_content,
+                        "sha": sha
+                    }
+                    requests.put(url, headers=headers, json=data)
+                else:
+                    # Файл не существует - создаем новый
+                    data = {
+                        "message": f"Initial backup {filename}",
+                        "content": encoded_content
+                    }
+                    requests.put(url, headers=headers, json=data)
+                    
+        logging.info("✅ Резервная копия создана в GitHub")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка backup в GitHub: {e}")
+        return False
+
+def restore_from_github():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    
+    try:
+        for filename in BACKUP_FILES:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+            headers = {
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                content = response.json()["content"]
+                decoded_content = base64.b64decode(content).decode("utf-8")
+                
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(decoded_content)
+                    
+        logging.info("✅ Данные восстановлены из GitHub")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка восстановления из GitHub: {e}")
+        return False
+
+# ==================== КОНФИГУРАЦИЯ ТЕМ ====================
+# Инициализация ID тем (None = не настроено). Используйте /setup_topics чтобы задать.
+TOPIC_IDS = {
+    "HUMAN_CHAT": 8,
+    "BOT_CHAT": 3,
+    "NEWS_CHAT": 6,
+    "NEWS_RETAKE_CHAT": 1408,
+}
+
+# ==================== УТИЛИТЫ ====================
+def extract_command(text: str, bot_username: str) -> str:
+    """Извлекает чистую команду из текста с упоминанием бота"""
+    if not text:
+        return ""
+    text = re.sub(rf'@{re.escape(bot_username)}\s*', '', text)
+    return text.strip()
+
+def escape_markdown_v2(text):
+    """Экранирование символов для MarkdownV2"""
+    if not text:
+        return ""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+def is_allowed_topic(message: Message) -> bool:
+    """Проверяет можно ли боту отвечать в этой теме"""
+    topic_id = message.message_thread_id
+
+    # Если темы не настроены — разрешаем отвечать везде
+    if not any(v is not None for v in TOPIC_IDS.values()):
+        return True
+
+    # Если сообщение в основном чате — запрещаем
+    if topic_id is None:
+        return False
+
+    # Разрешаем отвечать только в теме бота (BOT_CHAT)
+    return topic_id == TOPIC_IDS.get("BOT_CHAT")
+
+def is_news_topic(message: Message) -> bool:
+    """Проверяет это тема для новостей"""
+    nid = TOPIC_IDS.get("NEWS_CHAT")
+    if nid is None:
+        return False
+    return message.message_thread_id == nid
+
+def normalize_url(url, base_url="https://t.me"):
+    if not url:
+        return url
+    if url.startswith('//'):
+        return 'https:' + url
+    elif url.startswith('/'):
+        return urljoin(base_url, url)
+    else:
+        return url
+
+def clean_markdown_text(text):
+    if not text:
+        return text
+    text = html.escape(text)
+    text = re.sub(r'\[([^\]]*)\]\([^\)]*$', r'\1', text)
+    text = re.sub(r'\*\*([^*]*)$', r'\1', text)
+    text = re.sub(r'\*([^*]*)$', r'\1', text)
+    text = re.sub(r'__([^_]*)$', r'\1', text)
+    text = re.sub(r'`([^`]*)$', r'\1', text)
+    text = re.sub(r'_{3,}', '___', text)
+    return text
+
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ ====================
+def load_last_post():
+    """Загрузка состояния обработанных постов по каналам (новый формат)
+    Возвращает dict: {"channels": {channel: {"last_post_time": ..., "processed_posts": [...]}}}
     """
     try:
-        stats = await faceit_api_get_stats(steam_id)
-        if stats:
-            return stats
-        return await get_fallback_stats(steam_id)
+        if not os.path.exists(LAST_POST_FILE):
+            return {
+                "channels": {
+                    channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+                }
+            }
+        with open(LAST_POST_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return {
+                    "channels": {
+                        channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+                    }
+                }
+            data = json.loads(content)
+            # Конвертация старого формата
+            if not isinstance(data, dict) or "channels" not in data:
+                old_time = data.get("last_post_time")
+                old_posts = data.get("processed_posts", [])
+                data = {"channels": {channel: {"last_post_time": old_time, "processed_posts": old_posts} for channel in TELEGRAM_CHANNELS}}
+            return data
     except Exception as e:
-        logging.exception(f"Ошибка при вызове Faceit API: {e}")
-        return await get_fallback_stats(steam_id)
+        logging.error(f"Ошибка загрузки last_post: {e}")
+        return {
+            "channels": {
+                channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+            }
+        }
 
-
-async def get_fallback_stats(steam_id):
-    """Возвращает базовую информацию когда Faceit недоступен"""
+def save_users(users_data):
+    """Сохранение данных пользователей"""
     try:
-        # Пробуем получить хотя бы ник из Steam
-        steam_url = f"https://steamcommunity.com/profiles/{steam_id}?xml=1"
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(steam_url) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    # Простой парсинг Steam профиля
-                    nick_match = re.search(r'<steamID><!\[CDATA\[(.*?)\]\]></steamID>', text)
-                    steam_name = nick_match.group(1) if nick_match else f"Игрок {steam_id[-4:]}"
-                    
-                    return {
-                        "steam_name": steam_name,
-                        "faceit_nick": steam_name,
-                        "faceit_level": "?",
-                        "ELO": "?",
-                        "Matches": "?",
-                        "K/D": "?",
-                        "Winrt": "?",
-                        "cs_hours": "?",
-                        "source": "Steam Fallback"
-                    }
-    except Exception:
-        pass
-    
-    # Минимальная fallback статистика
-    return {
-        "steam_name": f"Игрок {steam_id[-4:]}",
-        "faceit_nick": f"Игрок {steam_id[-4:]}",
-        "faceit_level": "?",
-        "ELO": "?",
-        "Matches": "?",
-        "K/D": "?",
-        "Winrt": "?",
-        "cs_hours": "?",
-        "source": "Fallback"
-    }
-# (старый HTML-парсер и обходы удалены — теперь используем `faceit_client`)
+        with open(USERS_FILE, "w", encoding='utf-8') as f:
+            json.dump(users_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения users: {e}")
 
-async def get_fallback_stats(steam_id):
-    """Возвращает базовую информацию когда Faceit недоступен"""
+def load_users():
+    """Загрузка данных пользователей"""
     try:
-        # Пробуем получить хотя бы ник из Steam
-        steam_url = f"https://steamcommunity.com/profiles/{steam_id}?xml=1"
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(steam_url) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    # Простой парсинг Steam профиля
-                    nick_match = re.search(r'<steamID><!\[CDATA\[(.*?)\]\]></steamID>', text)
-                    steam_name = nick_match.group(1) if nick_match else f"Игрок {steam_id[-4:]}"
-                    
-                    return {
-                        "steam_name": steam_name,
-                        "faceit_nick": steam_name,
-                        "faceit_level": "?",
-                        "ELO": "?",
-                        "Matches": "?",
-                        "K/D": "?",
-                        "Winrt": "?",
-                        "cs_hours": "?",
-                        "source": "Steam Fallback"
-                    }
-    except:
-        pass
-    
-    # Минимальная fallback статистика
-    return {
-        "steam_name": f"Игрок {steam_id[-4:]}",
-        "faceit_nick": f"Игрок {steam_id[-4:]}",
-        "faceit_level": "?",
-        "ELO": "?",
-        "Matches": "?",
-        "K/D": "?",
-        "Winrt": "?",
-        "cs_hours": "?",
-        "source": "Fallback"
-    }
+        if not os.path.exists(USERS_FILE):
+            return {}
+        with open(USERS_FILE, "r", encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"❌ Ошибка загрузки users: {e}")
+        return {}
+    except Exception as e:
+        logging.error(f"Ошибка загрузки users: {e}")
+        return {
+            "channels": {
+                channel: {
+                    "last_post_time": None,
+                    "processed_posts": []
+                } for channel in TELEGRAM_CHANNELS
+            }
+        }
 
-# (старый парсер удалён — используем faceit_client с официальным API)
+
+def save_last_post(channel: str, post_time, processed_posts):
+    """Сохранение состояния обработанных постов для конкретного канала"""
+    try:
+        data = load_last_post()
+        if "channels" not in data:
+            data["channels"] = {}
+        data["channels"][channel] = {
+            "last_post_time": post_time,
+            "processed_posts": list(processed_posts)
+        }
+        with open(LAST_POST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения last_post для канала {channel}: {e}")
+
+
+def load_events():
+    try:
+        if not os.path.exists(EVENTS_FILE):
+            return {}
+        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            return json.loads(content) if content else {}
+    except Exception as e:
+        logging.error(f"Ошибка загрузки events: {e}")
+        return {}
+
+def save_events(events):
+    try:
+        with open(EVENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(events, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
+    except Exception as e:
+        logging.error(f"Ошибка сохранения events: {e}")
+
+def load_memory():
+    try:
+        if not os.path.exists(MEMORY_FILE):
+            return {}
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            return json.loads(content) if content else {}
+    except Exception as e:
+        logging.error(f"Ошибка загрузки memory: {e}")
+        return {}
+
+def save_memory(memory):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(async_backup_to_github())
+    except Exception as e:
+        logging.error(f"Ошибка сохранения memory: {e}")
+
+async def async_backup_to_github():
+    """Асинхронный backup в GitHub"""
+    await asyncio.get_event_loop().run_in_executor(None, backup_to_github)
+
+# ==================== ИНИЦИАЛИЗАЦИЯ ДАННЫХ ====================
+cs2_events = load_events()
+user_memory = load_memory()
+
+# ==================== КЛАВИАТУРЫ ====================
+cancel_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Отмена")]],
+    resize_keyboard=True,
+    one_time_keyboard=True
+)
+
+# ==================== ШУТКИ ====================
+JOKES = [
+    "Ты в CS2 как экономика России — стабильно 0/15/3.",
+    "Когда ты говоришь 'я саппорт' — вся команда держит дым, брат.",
+    "Если у тебя не получается стрелять — попробуй выключить монитор, в твоём случае поможет.",
+    "Твой пинг в CS2 выше, чем твой IQ, и это о чём-то говорит.",
+    "Не переживай, что проиграл катку — ты просто статистику улучшаешь другим!",
+    "Ты как тот охранник лоу-таба — стоишь и смотришь, как все проходят мимо.",
+    "Твой топ фраггер — это когда ты случайно убил кого-то с гранаты.",
+    "Когда ты с гранатой в руке — вся команда готовится к респавну.",
+    'Твоя тактика "сломался прицел" работает стабильнее, чем твой мозг.',
+    "Твой K/D ratio ниже, чем цена твоего самого дешёвого скина.",
+    "Ты тот типчик, который кидает дым в пентхаус, а сам идёт на B и умирает.",
+    "— Почему ты проиграл? \n— Да потому что ты один с флешкой в руке стоял, бот.",
+    "Твои скилы стрельбы как твои шутки — мимо.",
+    "Когда ты заходишь в тиму — все сразу хотят сдаваться.",
+    "Ты единственный, кто может проиграть 1х1 с ботом.",
+    "Твой аим как твои шансы на свидание — всегда ниже нуля.",
+    "Если бы CS2 был работой — тебя бы уволили после пистолетного раунда.",
+    "Ты покупаешь AWP чтобы все видели, что ты не просто бедный, но и бесполезный.",
+    "Когда ты говоришь 'я знаю все смоки' — команда плачет.",
+    "Твой голос в голосовом чате заставляет тиммейтов отключать звук.",
+    "Ты как тот баг с текстурой — все на тебя натыкаются и раздражаются.",
+    "Твои флешки ослепляют команду чаще, чем врагов.",
+    "Ты тот, кто покупает полный набор и умирает первым.",
+    "Твой Game Sense как GPS в подземке — не работает.",
+    "Когда ты лидер — это как слепой ведёт слепых, но с гранатами.",
+    "Ты проигрываешь даже в режиме с ботами... на легкой сложности.",
+    "Твой к/д как твои достижения в жизни — отрицательный.",
+    "Если бы за смерть давали деньги — ты был бы миллионером.",
+    "Ты как тот баг с hitbox — все через тебя проходят.",
+    "Когда ты говоришь 'пацаны, я пошёл на А' — вся команда бежит на Б.",
+    "Твоя тактика 'бежим рашить' заканчивается быстрее, чем твои отношения.",
+    "Ты тот, кто кричит 'кидаю флешку' и ослепляет своих.",
+    "Твой скин-кейшн как твоя жизнь — полное разочарование.",
+    "Когда ты в тиме — это 4 против 6.",
+    "Ты как тот игрок, который смотрит в пол, когда все стреляют.",
+    "Ты в CS2 как экономика России — стабильно 0/15/3.",
+    "Когда ты говоришь 'я саппорт' — вся команда держит дым, брат.",
+    "Если у тебя не получается стрелять — попробуй выключить монитор, в твоём случае поможет.",
+    "Твой пинг в CS2 выше, чем твой IQ, и это о чём-то говорит.",
+    "Ты как тот охранник лоу-таба — стоишь и смотришь, как все проходят мимо.",
+    "Ты взял муху пофоткать, да? Так вот, фотки не получились.",
+    "Ты покупаешь AWP, чтобы показать, что у тебя не скилл, а амбиции.",
+    "Когда ты кидаешь смок, сервер падает от стыда.",
+    "Ты как кейс в CS2 — все надеются на что-то хорошее, но внутри мусор.",
+    "Когда ты заходишь в тиммейтам в дискорд — FPS падает у всех.",
+    "Твоя флешка ослепила даже комментаторов.",
+    "Ты рашишь Б так, будто там халява на скины.",
+    "Когда ты берёшь муху — даже враги делают скрин, чтоб не забыть этот момент.",
+    "Ты играешь как VAC-бан — неожиданный и неприятный.",
+    "Твой aim как тикрейт в CS2 — нестабильный и больной.",
+    "Ты как новый патч — только всё ухудшаешь.",
+    "Твой микрофон громче, чем твой урон.",
+    "Когда ты берёшь AWP, сервер пишет: «Сожалеем».",
+    "Ты в тиме для атмосферы, а не для побед.",
+    "Твоя граната — идеальный пример дружеского огня.",
+    "Ты как баг в игре — все на тебя жалуются, но ничего не меняется.",
+    "Твой вклад в победу как мотивация учиться в воскресенье — его нет."
+]
+
+# ==================== Faceit СТАТИСТИКА ====================
+
+
 
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
@@ -483,149 +755,68 @@ async def handle_event_time(message: types.Message):
 async def stats_command(message: Message):
     if not is_allowed_topic(message):
         return
-        
+
     users = load_users()
     tg_id = str(message.from_user.id)
-    
+
     if tg_id not in users:
-        await message.reply("❌ Используй /bind <SteamID64> чтобы привязать Steam")
+        await message.reply("❌ Используй /bind <SteamID64> чтобы привязать Steam (или заполни faceit_nick в users.json)")
         return
 
     loading_msg = await message.reply("🔄 Получаю статистику...")
-    
-    # Получаем статистику через Faceit API (с fallback)
-    stats = await get_faceit_stats(users[tg_id]["steam_id"])
-    
-    if not stats:
-        await loading_msg.edit_text("❌ Не удалось получить статистику.")
-        return
 
-    text = "📊 *Статистика игрока*\n\n"
-    
-    # Steam Stats
-    text += "🎮 *Steam статистика:*\n"
-    text += f"• Ник: `{escape_markdown_v2(str(stats['steam_name']))}`\n"
-    text += f"• K/D: `{stats.get('steam_kd', '?')}`\n"
-    text += f"• Процент HS: `{stats.get('steam_hs', '?')}`\n"
-    text += f"• Винрейт: `{stats.get('steam_winrate', '?')}`\n"
-    text += f"• Часы CS: `{stats.get('cs_hours', '?')}`\n"
-    text += f"• Часы CS2 (2 недели): `{stats.get('cs2_hours_2weeks', '?')}`\n\n"
-    
-    # Faceit Stats
-    text += "🎯 *Faceit статистика:*\n"
-    text += f"• Ник: `{escape_markdown_v2(str(stats['faceit_nick']))}`\n"
-    text += f"• Ранг в регионе: `{stats.get('region_rank', '?')}`\n"
-    text += f"• ELO: `{stats.get('ELO', '?')}`\n"
-    text += f"• Уровень: `{stats.get('faceit_level', '?')}`\n"
-    text += f"• K/D: `{stats.get('K/D', '?')}`\n"
-    text += f"• Винрейт: `{stats.get('Winrt', '?')}`\n"
-    text += f"• Матчей: `{stats.get('Matches', '?')}`\n"
-    text += f"• Побед: `{stats.get('Wins', '?')}`\n"
-    text += f"• Процент HS: `{stats.get('headshots', '?')}`\n"
-    text += f"• ADR: `{stats.get('ADR', '?')}`\n"
-    text += f"• Entry Success Rate: `{stats.get('entry_success', '?')}`\n"
-    
-    if stats.get('recent_results') != '*':
-        text += f"• Последние матчи: `{stats.get('recent_results', '?')}`\n"
-    
-    text += f"\n🔗 *SteamID:* `{users[tg_id]['steam_id']}`\n"
-    text += f"📡 *Источник:* `{stats.get('source', '?')}`"
-    
-    await loading_msg.edit_text(text, parse_mode="MarkdownV2")
+    # Приоритет: faceit_nick из users.json. fallback на steam_id.
+    user_info = users[tg_id]
+    faceit_nick = user_info.get("faceit_nick")
+    steam_id = user_info.get("steam_id")
 
-@dp.message(Command("bind"))
-async def bind_steam(message: Message):
-    if not is_allowed_topic(message):
-        return
-        
-    args = message.text.split()
-    if len(args) != 2:
-        await message.reply("Использование: /bind <SteamID64>")
-        return
-
-    steam_id = args[1]
-    users = load_users()
-    
-    stats = await get_faceit_stats(steam_id)
-    users[str(message.from_user.id)] = {
-        "steam_id": steam_id,
-        "faceit_nick": stats["faceit_nick"] if stats else "Неизвестно"
-    }
-    
-    save_users(users)
-    await message.reply(f"✅ Привязан SteamID: {steam_id}")
-
-@dp.message(Command("refresh_stats"))
-async def refresh_stats_command(message: Message):
-    """Принудительное обновление статистики"""
-    if not is_allowed_topic(message):
-        return
-        
-    users = load_users()
-    tg_id = str(message.from_user.id)
-    
-    if tg_id not in users:
-        await message.reply("❌ Сначала привяжи Steam через /bind")
-        return
-
-    # Очищаем кеш для этого пользователя (через faceit_client)
-    steam_id = users[tg_id]["steam_id"]
     try:
-        faceit_clear_cache(steam_id)
-    except Exception:
-        pass
-    
-    await message.reply("🔄 Принудительно обновляю статистику...")
-    await stats_command(message)
+        card = await get_player_text_card(faceit_nick, steam_id, use_cache=True)
+    except Exception as e:
+        logging.exception("Ошибка при запросе Faceit: %s", e)
+        card = None
+
+    if not card:
+        await loading_msg.edit_text("❌ Не удалось получить статистику через Faceit API.")
+        return
+
+    await loading_msg.edit_text(card, parse_mode="MarkdownV2")
+
+@dp.message(Command("clear_faceit_cache"))
+async def clear_faceit_cache_cmd(message: Message):
+    if message.from_user.id not in [1089779100, 1404218084]:  # твои админы
+        await message.reply("❌ Только админы.")
+        return
+    clear_cache()
+    await message.reply("✅ Faceit cache очищен.")
 
 @dp.message(Command("list_all_stats"))
 async def list_all_stats(message: types.Message):
     if not is_allowed_topic(message):
         return
-        
+
     users = load_users()
     if not users:
         await message.reply("Пользователей пока нет.")
         return
 
-    def format_value(value, add_percent=False):
-        """Форматирует значение для вывода с экранированием"""
-        if not value or value == '?':
-            return '?'
-        value = str(value).strip().rstrip('%')
-        if add_percent and value != '?' and value.replace('.', '').isdigit():
-            value = f"{value}%"
-        return escape_markdown_v2(str(value))
+    loading = await message.reply("🔄 Собираю статистику для всех... (берём из кеша, если свежо)")
+    try:
+        text = await get_multiple_players_text(users, use_cache=True)
+    except Exception as e:
+        logging.exception("Ошибка при сборе статистики всех игроков: %s", e)
+        text = "❌ Ошибка получения статистики."
 
-    msg = "📊 *Статистика всех игроков:*\n\n"
-    for tg_id, info in users.items():
-        if not info.get("steam_id"):
-            continue
-        stats = await get_faceit_stats(info["steam_id"])
-        if stats:
-            escaped_nick = escape_markdown_v2(str(info.get('faceit_nick', stats['steam_name'])))
-            msg += f"*{escaped_nick}:*\n"
-            
-            # Steam Stats
-            msg += "🎮 *Steam:*\n"
-            msg += f"• Имя: `{format_value(stats['steam_name'])}`\n"
-            msg += f"• K/D: `{format_value(stats.get('steam_kd'))}` • HS: `{format_value(stats.get('steam_hs'), True)}`\n"
-            msg += f"• WinRate: `{format_value(stats.get('steam_winrate'), True)}` • Часы CS: `{format_value(stats.get('cs_hours'))}`\n"
-            msg += f"• Часы CS2 \\(2 нед\\.\\): `{format_value(stats.get('cs2_hours_2weeks'))}`\n\n"
-            
-            # Faceit Stats
-            msg += "🎯 *Faceit:*\n"
-            msg += f"• Ранг региона: `{format_value(stats.get('region_rank'))}`\n"
-            msg += f"• ELO: `{format_value(stats.get('ELO'))}` • Уровень: `{format_value(stats.get('faceit_level'))}`\n"
-            msg += f"• K/D: `{format_value(stats.get('K/D'))}` • WinRate: `{format_value(stats.get('Winrt'), True)}`\n"
-            msg += f"• Матчи: `{format_value(stats.get('Matches'))}` • Победы: `{format_value(stats.get('Wins'))}`\n"
-            msg += f"• HS: `{format_value(stats.get('headshots'), True)}` • ADR: `{format_value(stats.get('ADR'))}`\n"
-            msg += f"• Entry Success: `{format_value(stats.get('entry_success'), True)}`\n"
-            if stats.get('recent_results') != '?' and stats.get('recent_results'):
-                msg += f"• Последние матчи: `{escape_markdown_v2(str(stats.get('recent_results','?')))}`\n"
-            msg += "\n"
-
-    await message.reply(msg, parse_mode="Markdown")
+    # Разбейте, если сообщение слишком длинное
+    if not text:
+        await loading.edit_text("❌ Не удалось получить статистику.")
+    else:
+        # Если текст длинный — отправим как несколько сообщений по 4000 символов для safety.
+        MAX = 3900
+        chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)]
+        await loading.delete()
+        for chunk in chunks:
+            await message.reply(chunk, parse_mode="MarkdownV2")
 
 @dp.message(Command("events"))
 async def show_events(message: Message):
@@ -749,9 +940,6 @@ async def handle_message(message: Message):
     user_id = str(message.from_user.id)
     users = load_users()
     user_stats = None
-    
-    if user_id in users:
-        user_stats = await get_faceit_stats(users[user_id]["steam_id"])
 
     history = user_memory.get(user_id, [])
     history.append({"role": "user", "content": text})
@@ -888,6 +1076,7 @@ async def main():
     except Exception as e:
         logging.error(f"❌ Ошибка при работе бота: {e}")
         raise
+
 
 if __name__ == "__main__":
     asyncio.run(main())
