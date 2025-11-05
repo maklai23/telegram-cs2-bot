@@ -24,456 +24,70 @@ import html
 from mistralai import Mistral
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8331249759:AAFjxWonHiDbenOnr9lNpdJ7v1Y6UJAJ56w")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV")
 BOT_USERNAME = "team_spirt2_bot"
 
 # Кеш для статистики (50 минут)
-faceit_cache = {}
-CACHE_DURATION = 3000
+# ==================== FACEIT API ====================
+from faceit_client import get_stats_cached as faceit_api_get_stats, clear_cache as faceit_clear_cache
 
-# Константы
-LAST_POST_FILE = "last_telegram_post.json"
-# Каналы для мониторинга (имена без @)
-TELEGRAM_CHANNELS = ["newcsgo", "retakenews"]
-CHECK_INTERVAL = 60
 
-CHAT_ID = -1003200108763
-TARGET_CHAT_ID = CHAT_ID
-USERS_FILE = "users.json"
-EVENTS_FILE = "events.json"
-MEMORY_FILE = "user_memory.json"
-
-MODEL = "mistral-medium-latest"
-client = Mistral(api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
-
-TRIGGER_WORDS = ["габен", "хуесос"]
-JOKE_TRIGGERS = ["анекдот", "шутка", "рофл", "прикол"]
-
-# ==================== GITHUB СИНХРОНИЗАЦИЯ ====================
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # формат: username/repo
-BACKUP_FILES = [USERS_FILE, EVENTS_FILE, MEMORY_FILE, LAST_POST_FILE]
-
-def backup_to_github():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False
-    
-    try:
-        for filename in BACKUP_FILES:
-            if os.path.exists(filename):
-                with open(filename, "r", encoding="utf-8") as f:
-                    content = f.read()
-                
-                # Кодируем в base64 для GitHub API
-                encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-                
-                # Проверяем существует ли файл в репозитории
-                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
-                headers = {
-                    "Authorization": f"token {GITHUB_TOKEN}",
-                    "Accept": "application/vnd.github.v3+json"
-                }
-                
-                response = requests.get(url, headers=headers)
-                
-                if response.status_code == 200:
-                    # Файл существует - обновляем
-                    sha = response.json()["sha"]
-                    data = {
-                        "message": f"Backup {filename}",
-                        "content": encoded_content,
-                        "sha": sha
-                    }
-                    requests.put(url, headers=headers, json=data)
-                else:
-                    # Файл не существует - создаем новый
-                    data = {
-                        "message": f"Initial backup {filename}",
-                        "content": encoded_content
-                    }
-                    requests.put(url, headers=headers, json=data)
-                    
-        logging.info("✅ Резервная копия создана в GitHub")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Ошибка backup в GitHub: {e}")
-        return False
-
-def restore_from_github():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False
-    
-    try:
-        for filename in BACKUP_FILES:
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
-            headers = {
-                "Authorization": f"token {GITHUB_TOKEN}",
-                "Accept": "application/vnd.github.v3+json"
-            }
-            
-            response = requests.get(url, headers=headers)
-            if response.status_code == 200:
-                content = response.json()["content"]
-                decoded_content = base64.b64decode(content).decode("utf-8")
-                
-                with open(filename, "w", encoding="utf-8") as f:
-                    f.write(decoded_content)
-                    
-        logging.info("✅ Данные восстановлены из GitHub")
-        return True
-    except Exception as e:
-        logging.error(f"❌ Ошибка восстановления из GitHub: {e}")
-        return False
-
-# ==================== КОНФИГУРАЦИЯ ТЕМ ====================
-# Инициализация ID тем (None = не настроено). Используйте /setup_topics чтобы задать.
-TOPIC_IDS = {
-    "HUMAN_CHAT": 8,
-    "BOT_CHAT": 3,
-    "NEWS_CHAT": 6,
-    "NEWS_RETAKE_CHAT": 1408,
-}
-
-# ==================== УТИЛИТЫ ====================
-def extract_command(text: str, bot_username: str) -> str:
-    """Извлекает чистую команду из текста с упоминанием бота"""
-    if not text:
-        return ""
-    text = re.sub(rf'@{re.escape(bot_username)}\s*', '', text)
-    return text.strip()
-
-def escape_markdown_v2(text):
-    """Экранирование символов для MarkdownV2"""
-    if not text:
-        return ""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
-
-def is_allowed_topic(message: Message) -> bool:
-    """Проверяет можно ли боту отвечать в этой теме"""
-    topic_id = message.message_thread_id
-
-    # Если темы не настроены — разрешаем отвечать везде
-    if not any(v is not None for v in TOPIC_IDS.values()):
-        return True
-
-    # Если сообщение в основном чате — запрещаем
-    if topic_id is None:
-        return False
-
-    # Разрешаем отвечать только в теме бота (BOT_CHAT)
-    return topic_id == TOPIC_IDS.get("BOT_CHAT")
-
-def is_news_topic(message: Message) -> bool:
-    """Проверяет это тема для новостей"""
-    nid = TOPIC_IDS.get("NEWS_CHAT")
-    if nid is None:
-        return False
-    return message.message_thread_id == nid
-
-def normalize_url(url, base_url="https://t.me"):
-    if not url:
-        return url
-    if url.startswith('//'):
-        return 'https:' + url
-    elif url.startswith('/'):
-        return urljoin(base_url, url)
-    else:
-        return url
-
-def clean_markdown_text(text):
-    if not text:
-        return text
-    text = html.escape(text)
-    text = re.sub(r'\[([^\]]*)\]\([^\)]*$', r'\1', text)
-    text = re.sub(r'\*\*([^*]*)$', r'\1', text)
-    text = re.sub(r'\*([^*]*)$', r'\1', text)
-    text = re.sub(r'__([^_]*)$', r'\1', text)
-    text = re.sub(r'`([^`]*)$', r'\1', text)
-    text = re.sub(r'_{3,}', '___', text)
-    return text
-
-async def get_faceit_stats_cached(steam_id):
-    """Кешированная версия с fallback"""
-    now = time.time()
-    
-    # Проверяем кеш
-    if steam_id in faceit_cache:
-        cached_time, cached_data = faceit_cache[steam_id]
-        if now - cached_time < CACHE_DURATION:
-            return cached_data
-    
-    # Получаем свежие данные
-    stats = await get_faceit_stats(steam_id)
-    
-    # Если не удалось - используем старые кешированные данные (если есть)
-    if not stats and steam_id in faceit_cache:
-        return faceit_cache[steam_id][1]
-    
-    # Сохраняем в кеш
-    if stats:
-        faceit_cache[steam_id] = (now, stats)
-    
-    return stats
-
-# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ФАЙЛАМИ ====================
-def load_last_post():
-    """Загрузка состояния обработанных постов по каналам (новый формат)
-    Возвращает dict: {"channels": {channel: {"last_post_time": ..., "processed_posts": [...]}}}
+async def get_faceit_stats(steam_id):
+    """Получение статистики через официальный Faceit API (через faceit_client).
+    В качестве fallback использует Steam профиль, если API недоступен.
     """
     try:
-        if not os.path.exists(LAST_POST_FILE):
-            return {
-                "channels": {
-                    channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
-                }
-            }
-        with open(LAST_POST_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                return {
-                    "channels": {
-                        channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
+        stats = await faceit_api_get_stats(steam_id)
+        if stats:
+            return stats
+        return await get_fallback_stats(steam_id)
+    except Exception as e:
+        logging.exception(f"Ошибка при вызове Faceit API: {e}")
+        return await get_fallback_stats(steam_id)
+
+
+async def get_fallback_stats(steam_id):
+    """Возвращает базовую информацию когда Faceit недоступен"""
+    try:
+        # Пробуем получить хотя бы ник из Steam
+        steam_url = f"https://steamcommunity.com/profiles/{steam_id}?xml=1"
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(steam_url) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    # Простой парсинг Steam профиля
+                    nick_match = re.search(r'<steamID><!\[CDATA\[(.*?)\]\]></steamID>', text)
+                    steam_name = nick_match.group(1) if nick_match else f"Игрок {steam_id[-4:]}"
+                    
+                    return {
+                        "steam_name": steam_name,
+                        "faceit_nick": steam_name,
+                        "faceit_level": "?",
+                        "ELO": "?",
+                        "Matches": "?",
+                        "K/D": "?",
+                        "Winrt": "?",
+                        "cs_hours": "?",
+                        "source": "Steam Fallback"
                     }
-                }
-            data = json.loads(content)
-            # Конвертация старого формата
-            if not isinstance(data, dict) or "channels" not in data:
-                old_time = data.get("last_post_time")
-                old_posts = data.get("processed_posts", [])
-                data = {"channels": {channel: {"last_post_time": old_time, "processed_posts": old_posts} for channel in TELEGRAM_CHANNELS}}
-            return data
-    except Exception as e:
-        logging.error(f"Ошибка загрузки last_post: {e}")
-        return {
-            "channels": {
-                channel: {"last_post_time": None, "processed_posts": []} for channel in TELEGRAM_CHANNELS
-            }
-        }
-
-def save_users(users_data):
-    """Сохранение данных пользователей"""
-    try:
-        with open(USERS_FILE, "w", encoding='utf-8') as f:
-            json.dump(users_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения users: {e}")
-
-def load_users():
-    """Загрузка данных пользователей"""
-    try:
-        if not os.path.exists(USERS_FILE):
-            return {}
-        with open(USERS_FILE, "r", encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        logging.error(f"❌ Ошибка загрузки users: {e}")
-        return {}
-    except Exception as e:
-        logging.error(f"Ошибка загрузки users: {e}")
-        return {
-            "channels": {
-                channel: {
-                    "last_post_time": None,
-                    "processed_posts": []
-                } for channel in TELEGRAM_CHANNELS
-            }
-        }
-
-
-def save_last_post(channel: str, post_time, processed_posts):
-    """Сохранение состояния обработанных постов для конкретного канала"""
-    try:
-        data = load_last_post()
-        if "channels" not in data:
-            data["channels"] = {}
-        data["channels"][channel] = {
-            "last_post_time": post_time,
-            "processed_posts": list(processed_posts)
-        }
-        with open(LAST_POST_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        asyncio.create_task(async_backup_to_github())
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения last_post для канала {channel}: {e}")
-
-
-def load_events():
-    try:
-        if not os.path.exists(EVENTS_FILE):
-            return {}
-        with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            return json.loads(content) if content else {}
-    except Exception as e:
-        logging.error(f"Ошибка загрузки events: {e}")
-        return {}
-
-def save_events(events):
-    try:
-        with open(EVENTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(events, f, ensure_ascii=False, indent=2)
-        asyncio.create_task(async_backup_to_github())
-    except Exception as e:
-        logging.error(f"Ошибка сохранения events: {e}")
-
-def load_memory():
-    try:
-        if not os.path.exists(MEMORY_FILE):
-            return {}
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            return json.loads(content) if content else {}
-    except Exception as e:
-        logging.error(f"Ошибка загрузки memory: {e}")
-        return {}
-
-def save_memory(memory):
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(memory, f, ensure_ascii=False, indent=2)
-        asyncio.create_task(async_backup_to_github())
-    except Exception as e:
-        logging.error(f"Ошибка сохранения memory: {e}")
-
-async def async_backup_to_github():
-    """Асинхронный backup в GitHub"""
-    await asyncio.get_event_loop().run_in_executor(None, backup_to_github)
-
-# ==================== ИНИЦИАЛИЗАЦИЯ ДАННЫХ ====================
-cs2_events = load_events()
-user_memory = load_memory()
-
-# ==================== КЛАВИАТУРЫ ====================
-cancel_keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Отмена")]],
-    resize_keyboard=True,
-    one_time_keyboard=True
-)
-
-# ==================== ШУТКИ ====================
-JOKES = [
-    "Ты в CS2 как экономика России — стабильно 0/15/3.",
-    "Когда ты говоришь 'я саппорт' — вся команда держит дым, брат.",
-    "Если у тебя не получается стрелять — попробуй выключить монитор, в твоём случае поможет.",
-    "Твой пинг в CS2 выше, чем твой IQ, и это о чём-то говорит.",
-    "Не переживай, что проиграл катку — ты просто статистику улучшаешь другим!",
-    "Ты как тот охранник лоу-таба — стоишь и смотришь, как все проходят мимо.",
-    "Твой топ фраггер — это когда ты случайно убил кого-то с гранаты.",
-    "Когда ты с гранатой в руке — вся команда готовится к респавну.",
-    'Твоя тактика "сломался прицел" работает стабильнее, чем твой мозг.',
-    "Твой K/D ratio ниже, чем цена твоего самого дешёвого скина.",
-    "Ты тот типчик, который кидает дым в пентхаус, а сам идёт на B и умирает.",
-    "— Почему ты проиграл? \n— Да потому что ты один с флешкой в руке стоял, бот.",
-    "Твои скилы стрельбы как твои шутки — мимо.",
-    "Когда ты заходишь в тиму — все сразу хотят сдаваться.",
-    "Ты единственный, кто может проиграть 1х1 с ботом.",
-    "Твой аим как твои шансы на свидание — всегда ниже нуля.",
-    "Если бы CS2 был работой — тебя бы уволили после пистолетного раунда.",
-    "Ты покупаешь AWP чтобы все видели, что ты не просто бедный, но и бесполезный.",
-    "Когда ты говоришь 'я знаю все смоки' — команда плачет.",
-    "Твой голос в голосовом чате заставляет тиммейтов отключать звук.",
-    "Ты как тот баг с текстурой — все на тебя натыкаются и раздражаются.",
-    "Твои флешки ослепляют команду чаще, чем врагов.",
-    "Ты тот, кто покупает полный набор и умирает первым.",
-    "Твой Game Sense как GPS в подземке — не работает.",
-    "Когда ты лидер — это как слепой ведёт слепых, но с гранатами.",
-    "Ты проигрываешь даже в режиме с ботами... на легкой сложности.",
-    "Твой к/д как твои достижения в жизни — отрицательный.",
-    "Если бы за смерть давали деньги — ты был бы миллионером.",
-    "Ты как тот баг с hitbox — все через тебя проходят.",
-    "Когда ты говоришь 'пацаны, я пошёл на А' — вся команда бежит на Б.",
-    "Твоя тактика 'бежим рашить' заканчивается быстрее, чем твои отношения.",
-    "Ты тот, кто кричит 'кидаю флешку' и ослепляет своих.",
-    "Твой скин-кейшн как твоя жизнь — полное разочарование.",
-    "Когда ты в тиме — это 4 против 6.",
-    "Ты как тот игрок, который смотрит в пол, когда все стреляют.",
-    "Ты в CS2 как экономика России — стабильно 0/15/3.",
-    "Когда ты говоришь 'я саппорт' — вся команда держит дым, брат.",
-    "Если у тебя не получается стрелять — попробуй выключить монитор, в твоём случае поможет.",
-    "Твой пинг в CS2 выше, чем твой IQ, и это о чём-то говорит.",
-    "Ты как тот охранник лоу-таба — стоишь и смотришь, как все проходят мимо.",
-    "Ты взял муху пофоткать, да? Так вот, фотки не получились.",
-    "Ты покупаешь AWP, чтобы показать, что у тебя не скилл, а амбиции.",
-    "Когда ты кидаешь смок, сервер падает от стыда.",
-    "Ты как кейс в CS2 — все надеются на что-то хорошее, но внутри мусор.",
-    "Когда ты заходишь в тиммейтам в дискорд — FPS падает у всех.",
-    "Твоя флешка ослепила даже комментаторов.",
-    "Ты рашишь Б так, будто там халява на скины.",
-    "Когда ты берёшь муху — даже враги делают скрин, чтоб не забыть этот момент.",
-    "Ты играешь как VAC-бан — неожиданный и неприятный.",
-    "Твой aim как тикрейт в CS2 — нестабильный и больной.",
-    "Ты как новый патч — только всё ухудшаешь.",
-    "Твой микрофон громче, чем твой урон.",
-    "Когда ты берёшь AWP, сервер пишет: «Сожалеем».",
-    "Ты в тиме для атмосферы, а не для побед.",
-    "Твоя граната — идеальный пример дружеского огня.",
-    "Ты как баг в игре — все на тебя жалуются, но ничего не меняется.",
-    "Твой вклад в победу как мотивация учиться в воскресенье — его нет."
-]
-
-# ==================== FACEIT API ====================
-async def get_faceit_stats(steam_id):
-    """Улучшенная функция с обходом блокировок"""
-    try:
-        # Основной работающий источник - используем Steam API как fallback
-        sources = [
-            f"https://faceitfinder.com/profile/{steam_id}",
-                f"https://faceitstats.com/player/{steam_id}",
-                f"https://tracker.gg/faceit/profile/steam/{steam_id}"
-        ]
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "no-cache",
-            "pragma": "no-cache",
-            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "none",
-                "upgrade-insecure-requests": "1",
-                "Referer": "https://www.google.com/"
-        }
-
-        for url in sources:
-            try:
-                timeout = aiohttp.ClientTimeout(total=12)
-                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            html = await resp.text()
-                            soup = BeautifulSoup(html, "html.parser")
-                            stats = parse_faceit_simple(soup, url)
-                            if stats and stats.get('faceit_nick') != "?":
-                                logging.info(f"✅ Статистика получена с {url}")
-                                return stats
-                        else:
-                            logging.warning(f"❌ {url} вернул статус: {resp.status}")
-            except Exception as e:
-                logging.warning(f"❌ Не удалось получить с {url}: {str(e)[:100]}")
-                continue
-        
-        # Если все источники не работают - возвращаем базовую информацию
-        return await get_fallback_stats(steam_id)
-        
-    except Exception as e:
-        logging.error(f"❌ Ошибка получения статистики Faceit: {e}")
-        return await get_fallback_stats(steam_id)
+    except Exception:
+        pass
+    
+    # Минимальная fallback статистика
+    return {
+        "steam_name": f"Игрок {steam_id[-4:]}",
+        "faceit_nick": f"Игрок {steam_id[-4:]}",
+        "faceit_level": "?",
+        "ELO": "?",
+        "Matches": "?",
+        "K/D": "?",
+        "Winrt": "?",
+        "cs_hours": "?",
+        "source": "Fallback"
+    }
+# (старый HTML-парсер и обходы удалены — теперь используем `faceit_client`)
 
 async def get_fallback_stats(steam_id):
     """Возвращает базовую информацию когда Faceit недоступен"""
@@ -516,184 +130,8 @@ async def get_fallback_stats(steam_id):
         "source": "Fallback"
     }
 
-def parse_faceit_simple(soup, url):
-    """Упрощенный парсер для Faceit.
-    Пытается сначала взять данные по целевым селекторам, затем применяет regex-фоллбэк по тексту.
-    Возвращает словарь с полями, отсутствующие заполняются "*".
-    """
-    try:
-        stats = {
-            # Steam данные
-            "steam_name": "*",
-            "steam_kd": "*",
-            "steam_hs": "*",
-            "steam_winrate": "*",
-            "cs_hours": "*",
-            "cs2_hours_2weeks": "*",
-            
-            # Faceit данные
-            "faceit_nick": "*",
-            "region_rank": "*",
-            "ELO": "*",
-            "faceit_level": "*",
-            "K/D": "*",
-            "Winrt": "*",
-            "Matches": "*",
-            "Wins": "*",
-            "headshots": "*",
-            "ADR": "*",
-            "entry_success": "*",
-            "recent_results": "*",
-            
-            "source": url
-        }
+# (старый парсер удалён — используем faceit_client с официальным API)
 
-        text = soup.get_text(separator=" ", strip=True)
-
-        # site-specific selectors
-        if "faceitfinder" in url or "faceitplayerfinder" in url:
-            nickname = soup.select_one(".player-name")
-            level = soup.select_one(".player-level")
-            elo = soup.select_one(".player-elo")
-            steam_name = soup.select_one(".steam-name")  # Добавим получение steam_name
-
-            if nickname:
-                stats["faceit_nick"] = nickname.text.strip()
-            
-            if steam_name:
-                stats["steam_name"] = steam_name.text.strip()
-
-            if level:
-                stats["faceit_level"] = level.text.strip()
-            
-            if elo:
-                stats["ELO"] = elo.text.strip()
-
-            # Steam профиль
-            steam_rows = soup.select('.account-steaminfo-container .account-steaminfo-row')
-            for row in steam_rows:
-                text = row.get_text(separator=' ', strip=True).lower()
-                value = row.select_one('.account-steaminfo-row-value')
-                if not value:
-                    continue
-                value_text = value.text.strip()
-
-                if 'k/d ratio' in text:
-                    stats['steam_kd'] = value_text
-                elif 'headshot' in text or 'hs' in text:
-                    stats['steam_hs'] = value_text
-                elif 'winrate' in text:
-                    stats['steam_winrate'] = value_text
-                elif 'cs total hours' in text:
-                    stats['cs_hours'] = value_text.replace(',', '')
-                elif 'cs2 last 2 weeks' in text:
-                    stats['cs2_hours_2weeks'] = value_text.replace(',', '')
-
-            # Faceit профиль
-            faceit_rows = soup.select('.account-steaminfo-container ~ .account-steaminfo-container .account-steaminfo-row')
-            for row in faceit_rows:
-                text = row.get_text(separator=' ', strip=True).lower()
-                value = row.select_one('.account-steaminfo-row-value')
-                if not value:
-                    continue
-                value_text = value.text.strip()
-
-                if 'faceit nick' in text:
-                    stats['faceit_nick'] = value_text
-                elif 'region rank' in text:
-                    stats['region_rank'] = value_text
-                elif 'elo' in text:
-                    stats['ELO'] = value_text
-                elif 'skill level' in text:
-                    stats['faceit_level'] = value_text
-                elif 'kd/ratio' in text:
-                    stats['K/D'] = value_text
-                elif 'winrate' in text:
-                    stats['Winrt'] = value_text
-                elif 'matches' in text:
-                    stats['Matches'] = value_text
-                elif 'wins' in text:
-                    stats['Wins'] = value_text
-                elif 'headshot' in text or 'hs' in text:
-                    stats['headshots'] = value_text
-                elif 'adr' in text:
-                    stats['ADR'] = value_text
-                elif 'entry success' in text:
-                    stats['entry_success'] = value_text
-
-            # Recent Results
-            recent_results = []
-            result_items = soup.select('.recent-results-item')
-            for item in result_items[:5]:  # берем последние 5 матчей
-                result = item.get_text(strip=True)
-                recent_results.append(result)
-            stats['recent_results'] = ' '.join(recent_results) if recent_results else '*'
-
-            # собираем все блоки статистики (видимые и скрытые)
-            blocks = soup.select('.account-faceit-stats')
-            for block in blocks:
-                items = block.select('.account-faceit-stats-single')
-                for item in items:
-                    strong = item.select_one('strong')
-                    value = strong.text.strip() if strong else item.get_text(strip=True)
-                    label_text = item.get_text(separator=' ', strip=True)
-                    # убираем значение из текста метки
-                    label = label_text.replace(value, '').replace(':', '').strip().lower()
-                    if 'matches' in label:
-                        stats['Matches'] = value
-                    elif 'elo' in label:
-                        stats['ELO'] = value
-                    elif 'k/d' in label or 'k/d' in label_text.lower():
-                        stats['K/D'] = value
-                    elif 'winrt' in label or 'win' in label:
-                        stats['Winrt'] = value
-
-            # CS total hours ищется в блоках account-steaminfo-row
-            steaminfo_rows = soup.select('.account-steaminfo-row')
-            for row in steaminfo_rows:
-                txt = row.get_text(separator=' ', strip=True).lower()
-                if 'cs total hours' in txt or 'cs total hours' in row.text:
-                    val = row.select_one('.account-steaminfo-row-value')
-                    if val:
-                        stats['cs_hours'] = val.text.strip()
-                        break
-
-        # Общий regex-фоллбэк по тексту страницы (если какое-то поле осталось '*')
-        if stats['ELO'] == '*':
-            m = re.search(r"ELO[:\s]*([0-9]{2,4})", text, re.IGNORECASE)
-            if m:
-                stats['ELO'] = m.group(1)
-
-        if stats['Matches'] == '*':
-            m = re.search(r"Matches[:\s]*([0-9]{1,5})", text, re.IGNORECASE)
-            if m:
-                stats['Matches'] = m.group(1)
-
-        if stats['Winrt'] == '*':
-            m = re.search(r"Win(?: |-)rt[:\s]*([0-9]{1,3}%?)", text, re.IGNORECASE)
-            if m:
-                stats['Winrt'] = m.group(1)
-
-        if stats['K/D'] == '*':
-            m = re.search(r"K\/?D[:\s]*([0-9]+\.?[0-9]*)", text, re.IGNORECASE)
-            if m:
-                stats['K/D'] = m.group(1)
-
-        if stats['cs_hours'] == '*':
-            m = re.search(r"CS total hours[:\s]*([0-9]+\.?[0-9]*)", text, re.IGNORECASE)
-            if m:
-                stats['cs_hours'] = m.group(1)
-
-        # если ника нет - попробуем steam_name
-        if stats['faceit_nick'] == '*' and stats.get('steam_name') and stats['steam_name'] != '*':
-            stats['faceit_nick'] = stats['steam_name']
-
-        logging.info(f"✅ Статистика получена (источник: {stats.get('source')}) faceit_nick={stats.get('faceit_nick')} level={stats.get('faceit_level')} ELO={stats.get('ELO')}")
-        return stats
-
-    except Exception as e:
-        logging.exception(f"❌ Ошибка парсинга: {e}")
-        return None
 # ==================== МОНИТОРИНГ КАНАЛА ====================
 def create_post_id(post):
     text_hash = hash(post['text_plain'][:100] if post['text_plain'] else "media") % 10000
@@ -866,15 +304,6 @@ async def send_telegram_post(post, source_channel: str = None):
                     parse_mode="MarkdownV2",
                     **thread_kwargs
                 )
-        
-        elif clean_text:
-            await bot.send_message(
-                chat_id=target_chat_id,
-                text=caption,
-                parse_mode="MarkdownV2",
-                disable_web_page_preview=False,
-                **thread_kwargs
-            )
         
         logging.info("✅ Новый пост отправлен")
         return True
@@ -1064,8 +493,8 @@ async def stats_command(message: Message):
 
     loading_msg = await message.reply("🔄 Получаю статистику...")
     
-    # Используем кешированную версию
-    stats = await get_faceit_stats_cached(users[tg_id]["steam_id"])
+    # Получаем статистику через Faceit API (с fallback)
+    stats = await get_faceit_stats(users[tg_id]["steam_id"])
     
     if not stats:
         await loading_msg.edit_text("❌ Не удалось получить статистику.")
@@ -1104,30 +533,6 @@ async def stats_command(message: Message):
     
     await loading_msg.edit_text(text, parse_mode="MarkdownV2")
 
-    # Создаем информативное сообщение
-    lines = [
-        f"👤 **Игрок:** {stats['faceit_nick']}",
-        f"🎯 **Уровень:** {stats['faceit_level']}",
-        f"🏆 **ELO:** {stats.get('ELO', '?')}",
-    ]
-    
-    # Добавляем дополнительную статистику если есть
-    if stats.get('Matches') != '?':
-        lines.append(f"📊 **Матчи:** {stats['Matches']}")
-    if stats.get('K/D') != '?':
-        lines.append(f"🎯 **K/D:** {stats['K/D']}")
-    if winrate != '?':
-        lines.append(f"📈 **WinRate:** {winrate}")
-    if stats.get('cs_hours') != '?':
-        lines.append(f"⏰ **Часы CS:** {stats['cs_hours']}")
-    
-    lines.append(f"🔗 **SteamID:** `{users[tg_id]['steam_id']}`")
-    lines.append(f"📡 **Источник:** {stats.get('source', 'Faceit')}")
-    
-    text = "\n".join(lines)
-    
-    await loading_msg.edit_text(text)
-
 @dp.message(Command("bind"))
 async def bind_steam(message: Message):
     if not is_allowed_topic(message):
@@ -1163,10 +568,12 @@ async def refresh_stats_command(message: Message):
         await message.reply("❌ Сначала привяжи Steam через /bind")
         return
 
-    # Очищаем кеш для этого пользователя
+    # Очищаем кеш для этого пользователя (через faceit_client)
     steam_id = users[tg_id]["steam_id"]
-    if steam_id in faceit_cache:
-        del faceit_cache[steam_id]
+    try:
+        faceit_clear_cache(steam_id)
+    except Exception:
+        pass
     
     await message.reply("🔄 Принудительно обновляю статистику...")
     await stats_command(message)
@@ -1181,39 +588,41 @@ async def list_all_stats(message: types.Message):
         await message.reply("Пользователей пока нет.")
         return
 
+    def format_value(value, add_percent=False):
+        """Форматирует значение для вывода с экранированием"""
+        if not value or value == '?':
+            return '?'
+        value = str(value).strip().rstrip('%')
+        if add_percent and value != '?' and value.replace('.', '').isdigit():
+            value = f"{value}%"
+        return escape_markdown_v2(str(value))
+
     msg = "📊 *Статистика всех игроков:*\n\n"
     for tg_id, info in users.items():
         if not info.get("steam_id"):
             continue
         stats = await get_faceit_stats(info["steam_id"])
         if stats:
-            # Обработка WinRate
-            winrate = stats.get('Winrt', '?')
-            if winrate != '?':
-                winrate = winrate.replace('%', '').strip()
-                if winrate.replace('.', '').isdigit():
-                    winrate = f"{winrate}%"
-                    
-            escaped_nick = escape_markdown_v2(info.get('faceit_nick', stats['steam_name']))
+            escaped_nick = escape_markdown_v2(str(info.get('faceit_nick', stats['steam_name'])))
             msg += f"*{escaped_nick}:*\n"
             
             # Steam Stats
             msg += "🎮 *Steam:*\n"
-            msg += f"• Имя: `{escape_markdown_v2(str(stats['steam_name']))}`\n"
-            msg += f"• K/D: `{stats.get('steam_kd','?')}` • HS: `{stats.get('steam_hs','?')}`\n"
-            msg += f"• WinRate: `{stats.get('steam_winrate','?')}` • Часы CS: `{stats.get('cs_hours','?')}`\n"
-            msg += f"• Часы CS2 (2 нед.): `{stats.get('cs2_hours_2weeks','?')}`\n\n"
+            msg += f"• Имя: `{format_value(stats['steam_name'])}`\n"
+            msg += f"• K/D: `{format_value(stats.get('steam_kd'))}` • HS: `{format_value(stats.get('steam_hs'), True)}`\n"
+            msg += f"• WinRate: `{format_value(stats.get('steam_winrate'), True)}` • Часы CS: `{format_value(stats.get('cs_hours'))}`\n"
+            msg += f"• Часы CS2 \\(2 нед\\.\\): `{format_value(stats.get('cs2_hours_2weeks'))}`\n\n"
             
             # Faceit Stats
             msg += "🎯 *Faceit:*\n"
-            msg += f"• Ранг региона: `{stats.get('region_rank','?')}`\n"
-            msg += f"• ELO: `{stats.get('ELO','?')}` • Уровень: `{stats.get('faceit_level','?')}`\n"
-            msg += f"• K/D: `{stats.get('K/D','?')}` • WinRate: `{stats.get('Winrt','?')}`\n"
-            msg += f"• Матчи: `{stats.get('Matches','?')}` • Победы: `{stats.get('Wins','?')}`\n"
-            msg += f"• HS: `{stats.get('headshots','?')}` • ADR: `{stats.get('ADR','?')}`\n"
-            msg += f"• Entry Success: `{stats.get('entry_success','?')}`\n"
-            if stats.get('recent_results') != '*':
-                msg += f"• Последние матчи: `{stats.get('recent_results','?')}`\n"
+            msg += f"• Ранг региона: `{format_value(stats.get('region_rank'))}`\n"
+            msg += f"• ELO: `{format_value(stats.get('ELO'))}` • Уровень: `{format_value(stats.get('faceit_level'))}`\n"
+            msg += f"• K/D: `{format_value(stats.get('K/D'))}` • WinRate: `{format_value(stats.get('Winrt'), True)}`\n"
+            msg += f"• Матчи: `{format_value(stats.get('Matches'))}` • Победы: `{format_value(stats.get('Wins'))}`\n"
+            msg += f"• HS: `{format_value(stats.get('headshots'), True)}` • ADR: `{format_value(stats.get('ADR'))}`\n"
+            msg += f"• Entry Success: `{format_value(stats.get('entry_success'), True)}`\n"
+            if stats.get('recent_results') != '?' and stats.get('recent_results'):
+                msg += f"• Последние матчи: `{escape_markdown_v2(str(stats.get('recent_results','?')))}`\n"
             msg += "\n"
 
     await message.reply(msg, parse_mode="Markdown")
