@@ -4,6 +4,8 @@ import asyncio
 import time
 import logging
 from typing import Optional, Dict, Any
+from aiogram.utils.markdown import escape_md
+
 
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or os.getenv("FACEIT_KEY") or os.getenv("FACEIT")  # Railway var
 BASE_URL = "https://open.faceit.com/data/v4"
@@ -203,45 +205,160 @@ async def get_player_stats(nickname: Optional[str] = None, steam_id: Optional[st
 
     return result
 
-async def get_player_text_card(nickname: Optional[str] = None, steam_id: Optional[str] = None, use_cache: bool = True) -> Optional[str]:
+async def get_player_text_card(faceit_nick: str = None, steam_id: str = None, use_cache=True) -> str:
     """
-    Возвращает подготовленную строку в MarkdownV2 для отправки в Telegram.
+    Получает полную статистику игрока Faceit (CS2) и возвращает готовую карточку для Telegram.
+    faceit_nick предпочтительнее, fallback на steam_id.
     """
-    data = await get_player_stats(nickname=nickname, steam_id=steam_id, use_cache=use_cache)
-    if not data:
+    if not faceit_nick and not steam_id:
         return None
 
-    nick = data.get("nickname") or ""
-    elo = data.get("elo") or "—"
-    level = data.get("level") or "—"
-    lifetime = data.get("lifetime") or {}
+    token = os.getenv("FACEIT_API_KEY")
+    if not token:
+        logging.error("FACEIT_API_KEY не задан")
+        return None
 
-    # Популярные метрики, которые часто есть
-    matches = lifetime.get("Matches") or lifetime.get("Matches Played") or lifetime.get("Total matches") or lifetime.get("Matches")
-    wins = lifetime.get("Wins") or lifetime.get("Total wins")
-    winrate = lifetime.get("Win Rate") or lifetime.get("Win Rate %") or lifetime.get("Win Rate %")
-    kd = lifetime.get("Average K/D Ratio") or lifetime.get("K/D Ratio") or lifetime.get("K/D")
-    hs = lifetime.get("Average Headshots %") or lifetime.get("Headshots %") or lifetime.get("HS %")
-    adr = lifetime.get("Average Damage Round") or lifetime.get("Avg. Damage") or lifetime.get("ADR")
+    try:
+        # Получаем профиль игрока
+        url = "https://open.faceit.com/data/v4/players"
+        params = {}
+        if faceit_nick:
+            params["nickname"] = faceit_nick
+        elif steam_id:
+            params["game"] = "cs2"
+            params["game_player_id"] = steam_id
 
-    recent = data.get("recent_results_list", [])
-    recent_str = " ".join(recent) if recent else "—"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers={"Authorization": f"Bearer {token}"}) as resp:
+                if resp.status != 200:
+                    logging.error(f"Faceit API returned {resp.status}")
+                    return None
+                data = await resp.json()
 
-    country = data.get("country") or "—"
+        # Основная информация
+        nickname = escape_md(data.get("nickname", "–"))
+        country = escape_md(data.get("country", "–"))
+        faceit_id = data.get("player_id", "")
+        avatar = data.get("avatar", "")
+        faceit_url = escape_md(data.get("faceit_url", f"https://www.faceit.com/en/players/{nickname}"))
+        membership = ", ".join(data.get("memberships", [])) or "free"
+        activated = data.get("activated_at", "")
 
-    # Форматируем аккуратно и коротко (около 12–15 строк)
-    lines = []
-    lines.append(f"🎮 *{escape_md_v2(nick)}*")
-    lines.append(f"📍 Страна: `{escape_md_v2(country)}`")
-    lines.append(f"📈 Уровень: `{escape_md_v2(str(level))}`  •  ELO: `{escape_md_v2(str(elo))}`")
-    lines.append(f"🕹 Матчей: `{escape_md_v2(str(matches or '—'))}`  •  Побед: `{escape_md_v2(str(wins or '—'))}`  •  Winrate: `{escape_md_v2(str(winrate or '—'))}`")
-    lines.append(f"⚔️ K/D: `{escape_md_v2(str(kd or '—'))}`  •  HS%: `{escape_md_v2(str(hs or '—'))}`  •  ADR: `{escape_md_v2(str(adr or '—'))}`")
-    lines.append(f"🟢 Последние: `{escape_md_v2(recent_str)}`")
-    lines.append(f"🔗 Источник: `Faceit API`")
-    lines.append(f"_Обновлено: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(data.get('fetched_at', time.time())))}_")
+        # CS2 stats
+        cs2 = data.get("games", {}).get("cs2", {})
+        cs2_region = escape_md(cs2.get("region", "–"))
+        cs2_elo = cs2.get("faceit_elo", "–")
+        cs2_level = cs2.get("skill_level", "–")
+        cs2_name = escape_md(cs2.get("game_player_name", nickname))
 
-    text = "\n".join(lines)
-    return text
+        stats = cs2.get("lifetime", {})
+        matches = stats.get("Matches", {}).get("Value", 0)
+        wins = stats.get("Wins", {}).get("Value", 0)
+        winrate = f"{(wins/matches*100):.0f}%" if matches else "–"
+        kd = stats.get("KD", {}).get("Value", 0)
+        hs = stats.get("HS%", {}).get("Value", 0)
+        adr = stats.get("ADR", {}).get("Value", 0)
+
+        recent_matches = cs2.get("recent_results", [])  # список 1/0 или ID
+        recent_str = " ".join(str(escape_md(str(x))) for x in recent_matches[:10])  # максимум 10 последних
+
+        card = (
+            f"🎮 *{nickname}* (`{faceit_id}`)\n"
+            f"📍 Страна: `{country}`\n"
+            f"💻 Steam: `{cs2_name}`\n"
+            f"🎖 Уровень: `{cs2_level}`  •  ELO: `{cs2_elo}`\n"
+            f"📈 Матчей: `{matches}`  •  Побед: `{wins}`  •  Winrate: `{winrate}`\n"
+            f"⚔️ K/D: `{kd}`  •  HS%: `{hs}`  •  ADR: `{adr}`\n"
+            f"🟢 Последние: {recent_str}\n"
+            f"🔗 [Профиль Faceit]({faceit_url})\n"
+            f"🟡 Тип аккаунта: `{membership}`\n"
+            f"_Активирован: {activated}_"
+        )
+        return card
+
+    except Exception as e:
+        logging.exception("Ошибка получения карты игрока:")
+        return None
+
+async def get_player_full_card(faceit_nick: str = None, steam_id: str = None) -> str:
+    """Возвращает максимально полную карточку игрока Faceit CS2"""
+    if not faceit_nick and not steam_id:
+        return None
+
+    token = os.getenv("FACEIT_API_KEY")
+    if not token:
+        logging.error("FACEIT_API_KEY не задан")
+        return None
+
+    try:
+        url = "https://open.faceit.com/data/v4/players"
+        params = {"nickname": faceit_nick} if faceit_nick else {"game": "cs2", "game_player_id": steam_id}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers={"Authorization": f"Bearer {token}"}) as resp:
+                if resp.status != 200:
+                    logging.error(f"Faceit API returned {resp.status}")
+                    return None
+                data = await resp.json()
+
+        # Основная инфа
+        nickname = escape_md(data.get("nickname", "–"))
+        player_id = data.get("player_id", "–")
+        country = escape_md(data.get("country", "–"))
+        avatar = data.get("avatar", "")
+        faceit_url = escape_md(data.get("faceit_url", f"https://www.faceit.com/en/players/{nickname}"))
+        membership = ", ".join(data.get("memberships", ["free"]))
+        activated = data.get("activated_at", "–")
+        language = escape_md(data.get("settings", {}).get("language", "–"))
+
+        # Платформы
+        platforms = data.get("platforms", {})
+        platforms_str = "\n".join(f"{k}: {v}" for k, v in platforms.items()) or "–"
+
+        # CS2 stats
+        cs2 = data.get("games", {}).get("cs2", {})
+        cs2_level = cs2.get("skill_level", "–")
+        cs2_elo = cs2.get("faceit_elo", "–")
+        cs2_name = escape_md(cs2.get("game_player_name", nickname))
+        cs2_region = escape_md(cs2.get("region", "–"))
+
+        # Lifetime stats
+        lifetime = cs2.get("lifetime", {})
+        lifetime_stats = ""
+        for k, v in lifetime.items():
+            lifetime_stats += f"{escape_md(k)}: `{v.get('Value','–')}`\n"
+
+        # Recent matches
+        recent_matches = cs2.get("recent_results", [])
+        recent_str = " ".join(escape_md(str(x)) for x in recent_matches[:20])  # последние 20
+
+        # Friends
+        friends = data.get("friends_ids", [])
+        friends_str = ", ".join(friends[:10]) + ("..." if len(friends) > 10 else "")
+
+        # Infractions
+        infractions = data.get("infractions", {})
+        infractions_str = ", ".join(f"{k}: {v}" for k, v in infractions.items()) or "–"
+
+        card = (
+            f"🎮 *{nickname}* (`{player_id}`)\n"
+            f"📍 Страна: `{country}`  |  🌐 Язык: `{language}`\n"
+            f"💻 Steam nickname: `{cs2_name}`  |  Регион: `{cs2_region}`\n"
+            f"🎖 Уровень: `{cs2_level}`  •  ELO: `{cs2_elo}`\n"
+            f"🔗 [Faceit профиль]({faceit_url})  |  🟡 Тип аккаунта: `{membership}`\n"
+            f"🕒 Активирован: {activated}\n\n"
+            f"📊 *Lifetime Stats:*\n{lifetime_stats}\n"
+            f"🟢 Последние 20 матчей: {recent_str}\n"
+            f"🎮 Платформы:\n{platforms_str}\n"
+            f"👥 Друзья (до 10): {friends_str}\n"
+            f"⚠️ Инфракции: {infractions_str}\n"
+            f"🖼 Avatar: {avatar}"
+        )
+        return card
+
+    except Exception as e:
+        logging.exception("Ошибка получения полной карты игрока:")
+        return None
 
 async def get_multiple_players_text(users: dict, use_cache: bool = True, limit:int=30) -> str:
     """

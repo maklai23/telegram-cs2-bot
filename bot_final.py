@@ -20,14 +20,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
+from aiogram.utils.markdown import escape_md
 import html
 from mistralai import Mistral
-from faceit_api import get_player_text_card, get_multiple_players_text, get_player_stats, clear_cache
+from faceit_api import get_player_text_card, get_multiple_players_text, get_player_stats, clear_cache, get_player_full_card
 
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8331249759:AAFjxWonHiDbenOnr9lNpdJ7v1Y6UJAJ56w")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "V68jKeWkbgouyImfFx7rHS7RwdwsI0kV")
 BOT_USERNAME = "team_spirt2_bot"
+
+MAX_CHUNK = 3900
 
 # Кеш для статистики (50 минут)
 faceit_cache = {}
@@ -760,20 +763,20 @@ async def stats_command(message: Message):
     tg_id = str(message.from_user.id)
 
     if tg_id not in users:
-        await message.reply("❌ Используй /bind <SteamID64> чтобы привязать Steam (или заполни faceit_nick в users.json)")
+        await message.reply(
+            "❌ Используй /bind <SteamID64> чтобы привязать Steam "
+            "(или заполни faceit_nick в users.json)"
+        )
         return
 
-    loading_msg = await message.reply("🔄 Получаю статистику...")
+    loading_msg = await message.reply("🔄 Получаю полную статистику...")
 
-    # Приоритет: faceit_nick из users.json. fallback на steam_id.
     user_info = users[tg_id]
     faceit_nick = user_info.get("faceit_nick")
     steam_id = user_info.get("steam_id")
 
     try:
-        logging.info(f"Запрос Faceit для {faceit_nick=} / {steam_id=}")
-        card = await get_player_text_card(faceit_nick, steam_id, use_cache=True)
-        logging.info(f"Результат Faceit: {card}")
+        card = await get_player_full_card(faceit_nick, steam_id)
     except Exception as e:
         logging.exception("Ошибка при запросе Faceit: %s", e)
         card = None
@@ -782,7 +785,11 @@ async def stats_command(message: Message):
         await loading_msg.edit_text("❌ Не удалось получить статистику через Faceit API.")
         return
 
-    await loading_msg.edit_text(card, parse_mode="MarkdownV2")
+    # Разбиваем длинное сообщение на части
+    chunks = [card[i:i+MAX_CHUNK] for i in range(0, len(card), MAX_CHUNK)]
+    await loading_msg.delete()
+    for chunk in chunks:
+        await message.reply(chunk, parse_mode="MarkdownV2")
 
 @dp.message(Command("clear_faceit_cache"))
 async def clear_faceit_cache_cmd(message: Message):
@@ -802,23 +809,32 @@ async def list_all_stats(message: types.Message):
         await message.reply("Пользователей пока нет.")
         return
 
-    loading = await message.reply("🔄 Собираю статистику для всех... (берём из кеша, если свежо)")
-    try:
-        text = await get_multiple_players_text(users, use_cache=True)
-    except Exception as e:
-        logging.exception("Ошибка при сборе статистики всех игроков: %s", e)
-        text = "❌ Ошибка получения статистики."
+    loading_msg = await message.reply(
+        "🔄 Собираю полную статистику для всех пользователей..."
+    )
 
-    # Разбейте, если сообщение слишком длинное
-    if not text:
-        await loading.edit_text("❌ Не удалось получить статистику.")
-    else:
-        # Если текст длинный — отправим как несколько сообщений по 4000 символов для safety.
-        MAX = 3900
-        chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)]
-        await loading.delete()
-        for chunk in chunks:
-            await message.reply(chunk, parse_mode="MarkdownV2")
+    full_text = ""
+    for tg_id, user_info in users.items():
+        faceit_nick = user_info.get("faceit_nick")
+        steam_id = user_info.get("steam_id")
+        try:
+            card = await get_player_full_card(faceit_nick, steam_id)
+            if card:
+                full_text += card + "\n\n" + ("─" * 20) + "\n\n"
+        except Exception as e:
+            logging.exception("Ошибка получения данных для %s: %s", tg_id, e)
+            full_text += f"❌ Ошибка получения статистики для {tg_id}\n\n"
+
+    await loading_msg.delete()
+
+    if not full_text:
+        await message.reply("❌ Не удалось собрать статистику ни для одного пользователя.")
+        return
+
+    # Разбиваем на безопасные для Telegram части
+    chunks = [full_text[i:i+MAX_CHUNK] for i in range(0, len(full_text), MAX_CHUNK)]
+    for chunk in chunks:
+        await message.reply(chunk, parse_mode="MarkdownV2")
 
 @dp.message(Command("events"))
 async def show_events(message: Message):
